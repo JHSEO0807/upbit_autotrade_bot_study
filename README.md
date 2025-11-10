@@ -84,3 +84,7 @@ With the built-in DRY_RUN mode, users can test live signals
 without financial risk, making it ideal for algorithmic strategy validation.
 
 ============================================================================================
+
+<img width="657" height="538" alt="image" src="https://github.com/user-attachments/assets/80be2633-e366-4a27-83f5-cb3c324859b3" />
+
+<img width="963" height="829" alt="image" src="https://github.com/user-attachments/assets/b609c674-a5ca-4ba6-a0cb-aefdd8464eaa" />
