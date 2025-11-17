@@ -15,8 +15,8 @@ from ta.momentum import RSIIndicator
 UPBIT_API = "https://api.upbit.com/v1"
 
 # 🔑 본인 API 키 입력 (조회+거래 권한 필요, 출금 불필요)
-ACCESS_KEY = "p4KkASxyUHu2v2d3XAcxwLtFgWkk3FGLluIcTEeH"
-SECRET_KEY = "Fsows3MbzhiZVx3ajN5RBpHl6HkCgCkPlV7BltRr"
+ACCESS_KEY = ""
+SECRET_KEY = ""
 
 # =========================
 # 전략/루프 설정
