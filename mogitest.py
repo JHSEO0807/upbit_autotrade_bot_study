@@ -552,6 +552,7 @@ class VolatilityBreakoutBot:
                     return
 
                 current_high = curr["high"]
+                current_price = curr["close"]  # 현재가
 
                 if not validate_price(current_high):
                     logger.warning(f"[{ticker}] 유효하지 않은 현재 고가: {current_high}")
@@ -560,6 +561,9 @@ class VolatilityBreakoutBot:
                 # 돌파 상황 로깅 (진행률 표시)
                 diff = current_high - entry_price
                 progress = (current_high / entry_price - 1) * 100 if entry_price > 0 else 0
+
+                # 실시간 모니터링 정보 (매번 출력)
+                logger.info(f"📊 [{ticker}] 현재가: {current_price:,.0f}원 | 현재고가: {current_high:,.0f}원 | 목표가: {entry_price:,.0f}원 | 진행률: {progress:+.2f}%")
 
                 if current_high >= entry_price:
                     # 돌파 발생!
@@ -584,9 +588,6 @@ class VolatilityBreakoutBot:
 
                     self.buy_market(ticker, amount_krw)
                     self.in_position[ticker] = True
-                else:
-                    # 돌파 대기 중
-                    logger.debug(f"[{ticker}] 돌파 대기: {current_high:,.0f}원 / {entry_price:,.0f}원 ({progress:+.2f}%)")
 
         except Exception as e:
             logger.error(f"[{ticker}] process_symbol 예외: {e}", exc_info=True)
@@ -629,14 +630,30 @@ class VolatilityBreakoutBot:
                     continue
 
                 # 각 종목 처리
+                logger.info(f"\n{'='*60}")
+                logger.info(f"⏰ {now.strftime('%Y-%m-%d %H:%M:%S')} - 유니버스 {len(self.universe)}개 종목 모니터링 중")
+                logger.info(f"{'='*60}")
+
                 for ticker in self.universe:
                     self.process_symbol(ticker)
                     # API 호출 간격 조절 (초당 10회 제한)
                     time.sleep(0.1)
 
+                # 상태 요약 출력
+                logger.info(f"\n{'='*60}")
+                logger.info("📈 현재 상태 요약:")
+                logger.info(f"   보유 포지션: {sum(1 for v in self.in_position.values() if v)}개")
+                if DRY_RUN:
+                    logger.info(f"   가상 KRW: {self.virtual_krw:,.0f}원")
+                    if self.virtual_coin:
+                        logger.info(f"   보유 종목: {list(k for k, v in self.virtual_coin.items() if v > 0)}")
+                logger.info(f"   Entry Price 설정된 종목: {sum(1 for v in self.entry_price_map.values() if v is not None)}개")
+                logger.info(f"{'='*60}\n")
+
                 # 주기적으로 상태 저장
                 self.save_state()
 
+                logger.info(f"⏸️  {SLEEP_SEC}초 대기 중...\n")
                 time.sleep(SLEEP_SEC)
 
             except KeyboardInterrupt:
