@@ -8,6 +8,7 @@ import time
 import logging
 import requests
 import sys
+import os
 from datetime import datetime
 
 # Fix encoding for Windows console
@@ -44,6 +45,9 @@ INVESTMENT_PER_COIN = 0.95  # Investment ratio per coin (95% of balance)
 # Options: "minute1", "minute3", "minute5", "minute10", "minute15", "minute30", "minute60", "minute240", "day", "week", "month"
 CANDLE_INTERVAL = "minute5"  # Candle interval for technical analysis
 
+# Excel log file
+TRADE_LOG_FILE = "trade_history.xlsx"  # Excel file to save trade history
+
 
 class UpbitAutoTrader:
     def __init__(self, access_key, secret_key, dry_run=True):
@@ -61,6 +65,67 @@ class UpbitAutoTrader:
             self.lose_count = 0
             logger.info(f"*** 모의매매 모드 활성화 - 실제 거래가 체결되지 않습니다 ***")
             logger.info(f"초기 가상 자본금: {self.virtual_krw_balance:,.0f}원")
+
+            # Load existing trade history from Excel
+            self.load_trade_history_from_excel()
+
+    def load_trade_history_from_excel(self):
+        """Load existing trade history from Excel file"""
+        if not os.path.exists(TRADE_LOG_FILE):
+            logger.info(f"새로운 거래 기록 파일 생성 예정: {TRADE_LOG_FILE}")
+            return
+
+        try:
+            df = pd.read_excel(TRADE_LOG_FILE)
+            if len(df) > 0:
+                # Count wins and losses from existing data
+                sell_trades = df[df['거래유형'] == '매도']
+                if len(sell_trades) > 0:
+                    self.win_count = len(sell_trades[sell_trades['수익률(%)'] > 0])
+                    self.lose_count = len(sell_trades[sell_trades['수익률(%)'] <= 0])
+
+                logger.info(f"기존 거래 기록 로드 완료: {len(df)}건 (승: {self.win_count}, 패: {self.lose_count})")
+        except Exception as e:
+            logger.warning(f"거래 기록 파일 로드 실패: {e}")
+
+    def save_trade_to_excel(self, trade):
+        """Save trade to Excel file (append mode)"""
+        try:
+            # Prepare trade data for Excel
+            trade_data = {
+                '시간': trade['time'].strftime('%Y-%m-%d %H:%M:%S'),
+                '거래유형': trade['type_kr'],
+                '종목': trade['ticker'],
+                '수량': trade['amount'],
+                '체결가격': trade['price'],
+                '거래금액': trade['value']
+            }
+
+            # Add profit data for sell trades
+            if trade['type'] == 'SELL':
+                trade_data['매수가격'] = trade.get('buy_price', 0)
+                trade_data['손익(원)'] = trade.get('profit', 0)
+                trade_data['수익률(%)'] = trade.get('profit_rate', 0)
+            else:
+                trade_data['매수가격'] = None
+                trade_data['손익(원)'] = None
+                trade_data['수익률(%)'] = None
+
+            # Convert to DataFrame
+            new_row = pd.DataFrame([trade_data])
+
+            # Append to existing file or create new
+            if os.path.exists(TRADE_LOG_FILE):
+                existing_df = pd.read_excel(TRADE_LOG_FILE)
+                updated_df = pd.concat([existing_df, new_row], ignore_index=True)
+            else:
+                updated_df = new_row
+
+            # Save to Excel
+            updated_df.to_excel(TRADE_LOG_FILE, index=False, engine='openpyxl')
+
+        except Exception as e:
+            logger.error(f"엑셀 저장 중 오류: {e}")
 
     def get_top_gainers(self):
         """Get top gainers by daily change rate with volume filter (optimized with batch API call)"""
@@ -313,12 +378,14 @@ class UpbitAutoTrader:
                 trade = {
                     'time': datetime.now(),
                     'type': 'BUY',
+                    'type_kr': '매수',
                     'ticker': ticker,
                     'amount': coin_amount,
                     'price': current_price,
                     'value': buy_amount
                 }
                 self.trade_history.append(trade)
+                self.save_trade_to_excel(trade)
 
                 # Calculate current win rate
                 total_trades = self.win_count + self.lose_count
@@ -381,6 +448,7 @@ class UpbitAutoTrader:
                 trade = {
                     'time': datetime.now(),
                     'type': 'SELL',
+                    'type_kr': '매도',
                     'ticker': ticker,
                     'amount': balance,
                     'price': current_price,
@@ -390,6 +458,7 @@ class UpbitAutoTrader:
                     'profit_rate': profit_rate
                 }
                 self.trade_history.append(trade)
+                self.save_trade_to_excel(trade)
 
                 # Remove from portfolio
                 if ticker in self.virtual_portfolio:
