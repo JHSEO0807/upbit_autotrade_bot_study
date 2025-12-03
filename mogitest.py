@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-변동성 돌파 전략 자동매매 봇 (정배열 필터 제거 버전)
-- 매수: (이전캔들 고가 - 이전캔들 저가)*K + 현재캔들 시가 < 현재가격 → 매수
+변동성 돌파 + 이평선 정배열 + DMI/ADX 전략 자동매매 봇
+- 매수 조건:
+  1. 변동성 돌파: (이전캔들 고가 - 이전캔들 저가)*K + 현재캔들 시가 < 현재가격
+  2. 이전 캔들이 양봉
+  3. 이평선 정배열: SMA5 > SMA10 > SMA20
+  4. 이평선 기울기 양수: SMA5, SMA10, SMA20 모두 상승 중
+  5. DMI/ADX: ADX가 연속 상승 중 (ADX > ADX[1] > ADX[2])
 - 매도: 현재 캔들이 마감되고 새로운 캔들이 시작될 때 전량 매도
 """
 
@@ -99,6 +104,49 @@ def validate_price(price):
 
 def validate_dataframe(df, min_length):
     return df is not None and len(df) >= min_length
+
+
+def calculate_dmi_adx(df, period=14):
+    """
+    DMI/ADX 계산 함수
+    Returns: (plus_di, minus_di, adx)
+    """
+    import pandas as pd
+
+    high = df['high']
+    low = df['low']
+    close = df['close']
+
+    # True Range 계산
+    tr1 = high - low
+    tr2 = abs(high - close.shift(1))
+    tr3 = abs(low - close.shift(1))
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+    # ATR (Average True Range)
+    atr = tr.rolling(window=period).mean()
+
+    # Directional Movement
+    up_move = high - high.shift(1)
+    down_move = low.shift(1) - low
+
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0)
+
+    plus_dm_series = pd.Series(plus_dm, index=df.index).rolling(window=period).mean()
+    minus_dm_series = pd.Series(minus_dm, index=df.index).rolling(window=period).mean()
+
+    # Directional Indicators
+    plus_di = 100 * plus_dm_series / atr
+    minus_di = 100 * minus_dm_series / atr
+
+    # DX (Directional Index)
+    dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
+
+    # ADX (Average Directional Index)
+    adx = dx.rolling(window=period).mean()
+
+    return plus_di, minus_di, adx
 
 
 # ======== 메인 클래스 ========
@@ -339,10 +387,10 @@ class VolatilityBreakoutBot:
     def process_symbol(self, ticker):
         try:
             df = retry_on_failure(
-                lambda: pyupbit.get_ohlcv(ticker, interval=INTERVAL, count=40),
+                lambda: pyupbit.get_ohlcv(ticker, interval=INTERVAL, count=50),
                 logger=logger
             )
-            if not validate_dataframe(df, 20):
+            if not validate_dataframe(df, 45):
                 return
 
             prev = df.iloc[-2]
@@ -357,10 +405,10 @@ class VolatilityBreakoutBot:
                     self.in_position[ticker] = False
                 self.current_bar_time[ticker] = curr_time
 
-            # 2) 매수 조건 (변동성 돌파 ONLY)
+            # 2) 매수 조건 (변동성 돌파 + 이평선 정배열 + DMI/ADX)
             if not self.in_position.get(ticker, False):
 
-                # 변동폭
+                # ---- 변동성 돌파 계산 ----
                 range_prev = prev["high"] - prev["low"]
                 if range_prev <= 0:
                     return
@@ -371,10 +419,68 @@ class VolatilityBreakoutBot:
                 if not validate_price(entry_price) or not validate_price(current_price):
                     return
 
+                # ---- 이전 캔들 양봉 체크 ----
+                prev_candle_bullish = prev["close"] > prev["open"]
+                if not prev_candle_bullish:
+                    logger.debug(f"[{ticker}] 이전 캔들 음봉/도지 → SKIP")
+                    return
+
+                # ---- 이평선 계산 ----
+                sma5 = df['close'].rolling(window=5).mean()
+                sma10 = df['close'].rolling(window=10).mean()
+                sma20 = df['close'].rolling(window=20).mean()
+                sma40 = df['close'].rolling(window=40).mean()
+
+                curr_sma5 = sma5.iloc[-1]
+                curr_sma10 = sma10.iloc[-1]
+                curr_sma20 = sma20.iloc[-1]
+                curr_sma40 = sma40.iloc[-1]
+
+                prev_sma5 = sma5.iloc[-2]
+                prev_sma10 = sma10.iloc[-2]
+                prev_sma20 = sma20.iloc[-2]
+
+                # ---- 이평선 정배열 체크 ----
+                is_ma_aligned = (curr_sma5 > curr_sma10 and
+                                 curr_sma10 > curr_sma20 and
+                                 curr_sma20 > curr_sma40)
+                if not is_ma_aligned:
+                    logger.debug(f"[{ticker}] 이평선 정배열 아님 → SKIP")
+                    return
+
+                # ---- 이평선 기울기 양수 체크 ----
+                sma5_up = curr_sma5 > prev_sma5
+                sma10_up = curr_sma10 > prev_sma10
+                sma20_up = curr_sma20 > prev_sma20
+
+                slope_positive = sma5_up and sma10_up and sma20_up
+                if not slope_positive:
+                    logger.debug(f"[{ticker}] 이평선 기울기 음수 → SKIP")
+                    return
+
+                # ---- DMI/ADX 계산 및 체크 ----
+                try:
+                    plus_di, minus_di, adx = calculate_dmi_adx(df, period=14)
+
+                    curr_adx = adx.iloc[-1]
+                    prev_adx = adx.iloc[-2]
+                    prev2_adx = adx.iloc[-3]
+
+                    # ADX 연속 상승 체크
+                    adx_rising = curr_adx > prev_adx and prev_adx > prev2_adx
+
+                    if not adx_rising:
+                        logger.debug(f"[{ticker}] ADX 연속 상승 아님 → SKIP")
+                        return
+                except Exception as e:
+                    logger.warning(f"[{ticker}] DMI/ADX 계산 오류: {e}")
+                    return
+
                 logger.debug(f"[{ticker}] 현재가={current_price:.0f}, 기준가={entry_price:.0f}")
 
-                # ---- 변동성 돌파 ----
+                # ---- 변동성 돌파 확인 ----
                 if current_price >= entry_price:
+                    logger.info(f"[{ticker}] ✅ 모든 매수 조건 충족!")
 
                     if DRY_RUN:
                         amount_krw = self.virtual_krw * ORDER_KRW_PORTION
