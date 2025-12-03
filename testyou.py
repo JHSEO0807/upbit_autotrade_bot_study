@@ -6,6 +6,7 @@ import pandas as pd
 import numpy as np
 import time
 import logging
+import requests
 from datetime import datetime
 
 # Logging configuration
@@ -49,7 +50,7 @@ class UpbitAutoTrader:
             logger.info(f"Initial virtual balance: {self.virtual_krw_balance:,.0f} KRW")
 
     def get_top_gainers(self):
-        """Get top gainers by daily change rate with volume filter"""
+        """Get top gainers by daily change rate with volume filter (optimized with batch API call)"""
         try:
             # Get all KRW market tickers
             tickers = pyupbit.get_tickers(fiat="KRW")
@@ -57,30 +58,25 @@ class UpbitAutoTrader:
             # Filter out excluded coins
             tickers = [t for t in tickers if t not in EXCLUDED_COINS]
 
+            # Batch request to Upbit API for all tickers at once
+            url = "https://api.upbit.com/v1/ticker"
+            params = {"markets": ",".join(tickers)}
+
+            response = requests.get(url, params=params)
+            if response.status_code != 200:
+                logger.error(f"API request failed with status code: {response.status_code}")
+                return []
+
+            ticker_data = response.json()
+
             market_data = []
 
-            for ticker in tickers:
+            for data in ticker_data:
                 try:
-                    # Get current price
-                    current = pyupbit.get_current_price(ticker)
-                    if current is None:
-                        continue
-
-                    # Get daily OHLCV data (last 2 days)
-                    df = pyupbit.get_ohlcv(ticker, interval="day", count=2)
-                    if df is None or len(df) < 2:
-                        continue
-
-                    # Previous day close
-                    prev_close = df.iloc[-2]['close']
-                    # Current price
-                    current_price = current
-
-                    # Calculate change rate
-                    change_rate = ((current_price - prev_close) / prev_close) * 100
-
-                    # Get trading volume in KRW
-                    volume_krw = df.iloc[-1]['value']  # Today's trading volume
+                    ticker = data['market']
+                    change_rate = data['signed_change_rate'] * 100  # Convert to percentage
+                    volume_krw = data['acc_trade_price_24h']  # 24-hour accumulated trade price
+                    current_price = data['trade_price']
 
                     # Filter by minimum volume (20 billion KRW)
                     if volume_krw >= MIN_VOLUME:
@@ -91,10 +87,8 @@ class UpbitAutoTrader:
                             'current_price': current_price
                         })
 
-                    time.sleep(0.1)  # Avoid API rate limit
-
                 except Exception as e:
-                    logger.warning(f"Failed to get data for {ticker}: {e}")
+                    logger.warning(f"Failed to parse data for {data.get('market', 'unknown')}: {e}")
                     continue
 
             # Sort by change rate and select top N
