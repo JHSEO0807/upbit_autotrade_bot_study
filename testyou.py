@@ -173,12 +173,6 @@ class UpbitAutoTrader:
             market_data.sort(key=lambda x: x['change_rate'], reverse=True)
             top_coins = market_data[:TOP_GAINERS_COUNT]
 
-            logger.info(f"매매대상 {len(top_coins)}개 선정 완료 (상승률 TOP, 거래대금 {MIN_VOLUME/100000000:.0f}억 이상)")
-            if top_coins:
-                top_3 = top_coins[:3]
-                coin_list = ", ".join([f"{c['ticker']}({c['change_rate']:+.1f}%)" for c in top_3])
-                logger.info(f"  상위 3개: {coin_list}")
-
             return [coin['ticker'] for coin in top_coins]
 
         except Exception as e:
@@ -262,10 +256,6 @@ class UpbitAutoTrader:
                 return False
 
             result = condition1 and condition2 and condition3
-
-            if result:
-                logger.info(f"[매수신호] {ticker}")
-
             return result
 
         except Exception as e:
@@ -297,10 +287,6 @@ class UpbitAutoTrader:
                 return False
 
             result = (adx_0 < adx_1) and (adx_1 < adx_2) and (adx_2 < adx_3)
-
-            if result:
-                logger.info(f"[매도신호] {ticker}")
-
             return result
 
         except Exception as e:
@@ -491,14 +477,11 @@ class UpbitAutoTrader:
         new_targets = self.get_top_gainers()
 
         # Sell coins that are no longer in target list
-        removed_count = 0
         for ticker in self.target_coins:
             if ticker not in new_targets:
                 balance = self.get_balance(ticker)
                 if balance > 0:
-                    logger.info(f"[대상제외] {ticker} - 전량매도")
                     self.sell_coin(ticker)
-                    removed_count += 1
 
         self.target_coins = new_targets
 
@@ -516,9 +499,6 @@ class UpbitAutoTrader:
                 # Not holding - check buy condition
                 if self.check_buy_condition(ticker):
                     self.buy_coin(ticker)
-
-        # Print current portfolio
-        self.print_portfolio()
 
     def print_portfolio(self):
         """Print current portfolio"""
@@ -638,9 +618,6 @@ class UpbitAutoTrader:
         while True:
             try:
                 iteration += 1
-                logger.info(f"\n{'='*70}")
-                logger.info(f"[반복 #{iteration}] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-                logger.info(f"{'='*70}")
 
                 # Update target coins list
                 self.update_target_coins()
@@ -649,7 +626,6 @@ class UpbitAutoTrader:
                 self.monitor_and_trade()
 
                 # Wait
-                logger.info(f"[대기] {MONITOR_INTERVAL}초...\n")
                 time.sleep(MONITOR_INTERVAL)
 
             except KeyboardInterrupt:
