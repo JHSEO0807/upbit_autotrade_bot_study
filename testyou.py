@@ -7,14 +7,21 @@ import numpy as np
 import time
 import logging
 import requests
+import sys
 from datetime import datetime
+
+# Fix encoding for Windows console
+if sys.platform == 'win32':
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
 # Logging configuration
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('upbit_autotrade.log'),
+        logging.FileHandler('upbit_autotrade.log', encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
