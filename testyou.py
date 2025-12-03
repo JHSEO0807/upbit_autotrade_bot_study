@@ -24,6 +24,8 @@ ACCESS_KEY = "your_access_key"
 API_SECRET = "your_secret_key"
 
 # Global settings
+DRY_RUN = True  # Set to True for paper trading (simulation), False for real trading
+INITIAL_BALANCE = 1000000  # Initial virtual balance for dry run (1 million KRW)
 EXCLUDED_COINS = ['KRW-XRP', 'KRW-BTC', 'KRW-ETH', 'KRW-USDT']  # Coins to exclude
 MIN_VOLUME = 20000000000  # Minimum trading volume: 20 billion KRW
 TOP_GAINERS_COUNT = 20  # Top N gainers
@@ -32,10 +34,19 @@ INVESTMENT_PER_COIN = 0.95  # Investment ratio per coin (95% of balance)
 
 
 class UpbitAutoTrader:
-    def __init__(self, access_key, secret_key):
+    def __init__(self, access_key, secret_key, dry_run=True):
         """Initialize Upbit auto-trading bot"""
-        self.upbit = pyupbit.Upbit(access_key, secret_key)
+        self.dry_run = dry_run
+        self.upbit = pyupbit.Upbit(access_key, secret_key) if not dry_run else None
         self.target_coins = []  # Current target coins list
+
+        # Virtual portfolio for dry run mode
+        if self.dry_run:
+            self.virtual_krw_balance = INITIAL_BALANCE
+            self.virtual_portfolio = {}  # {ticker: amount}
+            self.trade_history = []  # Track all trades
+            logger.info(f"*** DRY RUN MODE ENABLED - NO REAL TRADES WILL BE EXECUTED ***")
+            logger.info(f"Initial virtual balance: {self.virtual_krw_balance:,.0f} KRW")
 
     def get_top_gainers(self):
         """Get top gainers by daily change rate with volume filter"""
@@ -229,21 +240,27 @@ class UpbitAutoTrader:
             return False
 
     def get_balance(self, ticker=None):
-        """Get balance"""
+        """Get balance (virtual or real depending on mode)"""
         try:
-            if ticker is None:
-                # KRW balance
-                return self.upbit.get_balance("KRW")
+            if self.dry_run:
+                # Virtual balance for dry run
+                if ticker is None:
+                    return self.virtual_krw_balance
+                else:
+                    return self.virtual_portfolio.get(ticker, 0)
             else:
-                # Specific coin balance
-                coin = ticker.split('-')[1]
-                return self.upbit.get_balance(coin)
+                # Real balance
+                if ticker is None:
+                    return self.upbit.get_balance("KRW")
+                else:
+                    coin = ticker.split('-')[1]
+                    return self.upbit.get_balance(coin)
         except Exception as e:
             logger.error(f"Error getting balance for {ticker}: {e}")
             return 0
 
     def buy_coin(self, ticker):
-        """Buy coin"""
+        """Buy coin (virtual or real depending on mode)"""
         try:
             krw_balance = self.get_balance()
 
@@ -261,22 +278,51 @@ class UpbitAutoTrader:
                 logger.warning(f"Buy amount too small: {buy_amount}")
                 return False
 
-            # Market order buy
-            result = self.upbit.buy_market_order(ticker, buy_amount)
+            # Get current price
+            current_price = pyupbit.get_current_price(ticker)
+            if current_price is None:
+                logger.warning(f"Cannot get price for {ticker}")
+                return False
 
-            if result:
-                logger.info(f"BUY SUCCESS: {ticker}, Amount: {buy_amount:.0f} KRW")
+            if self.dry_run:
+                # Virtual buy for dry run
+                coin_amount = buy_amount / current_price
+                self.virtual_krw_balance -= buy_amount
+                self.virtual_portfolio[ticker] = self.virtual_portfolio.get(ticker, 0) + coin_amount
+
+                # Record trade
+                trade = {
+                    'time': datetime.now(),
+                    'type': 'BUY',
+                    'ticker': ticker,
+                    'amount': coin_amount,
+                    'price': current_price,
+                    'value': buy_amount
+                }
+                self.trade_history.append(trade)
+
+                logger.info(f"[DRY RUN] BUY SUCCESS: {ticker}, "
+                          f"Amount: {coin_amount:.4f} coins, "
+                          f"Price: {current_price:,.0f} KRW, "
+                          f"Total: {buy_amount:.0f} KRW")
                 return True
             else:
-                logger.warning(f"BUY FAILED: {ticker}")
-                return False
+                # Real buy
+                result = self.upbit.buy_market_order(ticker, buy_amount)
+
+                if result:
+                    logger.info(f"BUY SUCCESS: {ticker}, Amount: {buy_amount:.0f} KRW")
+                    return True
+                else:
+                    logger.warning(f"BUY FAILED: {ticker}")
+                    return False
 
         except Exception as e:
             logger.error(f"Error buying {ticker}: {e}")
             return False
 
     def sell_coin(self, ticker):
-        """Sell coin"""
+        """Sell coin (virtual or real depending on mode)"""
         try:
             balance = self.get_balance(ticker)
 
@@ -287,16 +333,43 @@ class UpbitAutoTrader:
             if current_price is None:
                 return False
 
-            # Market order sell
-            result = self.upbit.sell_market_order(ticker, balance)
+            sell_value = balance * current_price
 
-            if result:
-                logger.info(f"SELL SUCCESS: {ticker}, Amount: {balance}, "
-                          f"Value: {balance * current_price:.0f} KRW")
+            if self.dry_run:
+                # Virtual sell for dry run
+                self.virtual_krw_balance += sell_value
+
+                # Record trade before removing from portfolio
+                trade = {
+                    'time': datetime.now(),
+                    'type': 'SELL',
+                    'ticker': ticker,
+                    'amount': balance,
+                    'price': current_price,
+                    'value': sell_value
+                }
+                self.trade_history.append(trade)
+
+                # Remove from portfolio
+                if ticker in self.virtual_portfolio:
+                    del self.virtual_portfolio[ticker]
+
+                logger.info(f"[DRY RUN] SELL SUCCESS: {ticker}, "
+                          f"Amount: {balance:.4f} coins, "
+                          f"Price: {current_price:,.0f} KRW, "
+                          f"Total: {sell_value:.0f} KRW")
                 return True
             else:
-                logger.warning(f"SELL FAILED: {ticker}")
-                return False
+                # Real sell
+                result = self.upbit.sell_market_order(ticker, balance)
+
+                if result:
+                    logger.info(f"SELL SUCCESS: {ticker}, Amount: {balance}, "
+                              f"Value: {sell_value:.0f} KRW")
+                    return True
+                else:
+                    logger.warning(f"SELL FAILED: {ticker}")
+                    return False
 
         except Exception as e:
             logger.error(f"Error selling {ticker}: {e}")
@@ -358,11 +431,62 @@ class UpbitAutoTrader:
                               f"Value: {value:,.0f} KRW")
 
         logger.info(f"Total Portfolio Value: {total_value:,.0f} KRW")
+
+        # Show P&L for dry run mode
+        if self.dry_run:
+            pnl = total_value - INITIAL_BALANCE
+            pnl_percent = (pnl / INITIAL_BALANCE) * 100
+            logger.info(f"P&L: {pnl:+,.0f} KRW ({pnl_percent:+.2f}%)")
+            logger.info(f"Total Trades: {len(self.trade_history)}")
+
         logger.info("=" * 50)
+
+    def print_trade_summary(self):
+        """Print trade history summary (for dry run mode)"""
+        if not self.dry_run or len(self.trade_history) == 0:
+            return
+
+        logger.info("\n" + "=" * 60)
+        logger.info("=== TRADING SUMMARY ===")
+        logger.info("=" * 60)
+
+        buy_count = sum(1 for t in self.trade_history if t['type'] == 'BUY')
+        sell_count = sum(1 for t in self.trade_history if t['type'] == 'SELL')
+
+        logger.info(f"Total Trades: {len(self.trade_history)} (Buy: {buy_count}, Sell: {sell_count})")
+        logger.info(f"\nRecent Trades:")
+
+        # Show last 10 trades
+        for trade in self.trade_history[-10:]:
+            logger.info(f"  {trade['time'].strftime('%Y-%m-%d %H:%M:%S')} - "
+                      f"{trade['type']:4s} {trade['ticker']:12s} "
+                      f"{trade['amount']:.4f} @ {trade['price']:,.0f} = "
+                      f"{trade['value']:,.0f} KRW")
+
+        # Calculate final P&L
+        krw_balance = self.get_balance()
+        total_value = krw_balance
+
+        for ticker in self.virtual_portfolio:
+            balance = self.virtual_portfolio[ticker]
+            if balance > 0:
+                current_price = pyupbit.get_current_price(ticker)
+                if current_price:
+                    total_value += balance * current_price
+
+        final_pnl = total_value - INITIAL_BALANCE
+        final_pnl_percent = (final_pnl / INITIAL_BALANCE) * 100
+
+        logger.info(f"\n=== FINAL RESULTS ===")
+        logger.info(f"Initial Balance: {INITIAL_BALANCE:,.0f} KRW")
+        logger.info(f"Final Value: {total_value:,.0f} KRW")
+        logger.info(f"Total P&L: {final_pnl:+,.0f} KRW ({final_pnl_percent:+.2f}%)")
+        logger.info("=" * 60)
 
     def run(self):
         """Main execution loop"""
         logger.info("=== Upbit Auto Trading Bot Started ===")
+        logger.info(f"Mode: {'DRY RUN (Paper Trading)' if self.dry_run else 'LIVE TRADING'}")
         logger.info(f"Monitor Interval: {MONITOR_INTERVAL} seconds")
         logger.info(f"Min Volume: {MIN_VOLUME/100000000:.0f} billion KRW")
         logger.info(f"Top Gainers: {TOP_GAINERS_COUNT}")
@@ -394,17 +518,23 @@ class UpbitAutoTrader:
                 logger.info(f"Waiting {MONITOR_INTERVAL} seconds before retry...")
                 time.sleep(MONITOR_INTERVAL)
 
+        # Print final summary when bot stops
+        self.print_trade_summary()
+
 
 def main():
     """Main function"""
-    # Check API keys
-    if ACCESS_KEY == "your_access_key" or API_SECRET == "your_secret_key":
-        logger.error("Please set your Upbit API keys in the script!")
-        logger.error("You can get API keys from: https://upbit.com/mypage/open_api_management")
-        return
+    # Check API keys (not required for dry run mode)
+    if not DRY_RUN:
+        if ACCESS_KEY == "your_access_key" or API_SECRET == "your_secret_key":
+            logger.error("Please set your Upbit API keys in the script!")
+            logger.error("You can get API keys from: https://upbit.com/mypage/open_api_management")
+            return
+    else:
+        logger.info("Running in DRY RUN mode - API keys not required")
 
     # Run auto-trading bot
-    trader = UpbitAutoTrader(ACCESS_KEY, API_SECRET)
+    trader = UpbitAutoTrader(ACCESS_KEY, API_SECRET, dry_run=DRY_RUN)
     trader.run()
 
 
