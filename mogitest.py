@@ -1,344 +1,444 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+변동성 돌파 전략 자동매매 봇 (정배열 필터 제거 버전)
+- 매수: (이전캔들 고가 - 이전캔들 저가)*K + 현재캔들 시가 < 현재가격 → 매수
+- 매도: 현재 캔들이 마감되고 새로운 캔들이 시작될 때 전량 매도
+"""
+
 import time
+import json
+import logging
+import sys
+import requests
 from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple
+from pathlib import Path
 
 import numpy as np
 import pyupbit
 
+
 # ======== 설정값 ========
-ACCESS_KEY = "YOUR_ACCESS_KEY"   # 실전 모드에서 본인 키로 교체
+ACCESS_KEY = "YOUR_ACCESS_KEY"
 SECRET_KEY = "YOUR_SECRET_KEY"
 
-DRY_RUN = True   # ★ 기본 True (모의매매). 실전 주문시 False 로 변경 ★
+DRY_RUN = True  # 모의매매 기본값(True)
+INTERVAL = "minute15"  # "minute5", "minute15", "minute60", "day" 등
 
-INTERVAL = "minute15"            # "minute5", "minute15", "minute60", "day" 등
-K = 0.5                         # 변동성 계수 (파인스크립트 k)
-SLEEP_SEC = 10                  # 메인 루프 대기 시간(초)
-UNIVERSE_REFRESH_MIN = 1       # 유니버스(감시 종목 리스트) 재계산 주기 (분 단위)
+K = 0.5
+SLEEP_SEC = 10
+UNIVERSE_REFRESH_MIN = 15
 
-INITIAL_VIRTUAL_KRW = 1_000_000  # DRY_RUN 가상 초기 자본
-ORDER_KRW_PORTION = 0.3          # 매수 시 보유 KRW 의 몇 %를 한 종목에 투자할지 (20%)
+INITIAL_VIRTUAL_KRW = 1_000_000
+ORDER_KRW_PORTION = 0.3  # 보유KRW의 30%
 
-VOLUME_THRESHOLD = 20_000_000_000  # 거래대금 200억 (일봉 'value' 기준)
-
-
-# ======== 전역 상태 변수 ========
-upbit = None
-
-universe = []      # 감시 대상 티커 리스트
-last_universe_update = None
-
-virtual_krw = INITIAL_VIRTUAL_KRW        # DRY_RUN 용 가상 원화
-virtual_coin = {}                        # {ticker: 수량}
-in_position = {}                         # {ticker: bool}
-
-current_bar_time = {}                    # {ticker: 현재 모니터링 중인 캔들의 시간}
-entry_price_map = {}                     # {ticker: 이번 캔들에서 사용할 돌파 기준가}
-invested_krw = {}                        # {ticker: 이 거래에 실제 투입한 KRW}
+VOLUME_THRESHOLD = 20_000_000_000  # 200억
 
 
-# ======== Upbit 초기화 ========
-def init_upbit():
-    global upbit
-    if DRY_RUN:
-        print("[INFO] DRY_RUN 모드입니다. 실제 주문은 전혀 실행되지 않습니다.")
-        upbit = None
-    else:
-        upbit = pyupbit.Upbit(ACCESS_KEY, SECRET_KEY)
-        print("[INFO] 실전 모드입니다. 실제 주문이 실행됩니다. 반드시 소액으로 테스트부터 하세요.")
+# ======== API 재시도 ========
+MAX_RETRIES = 3
+RETRY_DELAY = 1.0
+BACKOFF_FACTOR = 2.0
+
+STATE_FILE = Path(__file__).parent / "trading_state.json"
+LOG_FILE = Path(__file__).parent / "trading.log"
 
 
-# ======== 유니버스 구축 (전일대비 상승률 양수 + 거래대금 200억 이상) ========
-def build_universe():
-    """
-    업비트 KRW 마켓 전체를 순회하면서:
-      - 최근 2일 일봉 데이터 기준
-      - 전일 대비 등락률 > 0
-      - 거래대금(value) >= 200억
-    인 종목들만 universe 에 포함
-    """
-    global universe, last_universe_update
+# ======== 로깅 설정 ========
+def setup_logging():
+    logger = logging.getLogger("VolatilityBot")
+    logger.setLevel(logging.DEBUG)
 
-    tickers = pyupbit.get_tickers(fiat="KRW")
-    selected = []
+    if logger.handlers:
+        return logger
 
-    print("[INFO] 유니버스 계산 시작... (KRW 마켓 전체 스캔)")
+    file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(
+        logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    )
 
-    for ticker in tickers:
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(
+        logging.Formatter("[%(levelname)s] %(message)s")
+    )
+
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    return logger
+
+
+logger = setup_logging()
+
+
+# ======== 기본 유틸 ========
+def retry_on_failure(func, max_retries=MAX_RETRIES, delay=RETRY_DELAY,
+                     backoff=BACKOFF_FACTOR, logger=None):
+    last_exception = None
+    now_delay = delay
+    for attempt in range(max_retries):
         try:
-            df_day = pyupbit.get_ohlcv(ticker, interval="day", count=2)
-            if df_day is None or len(df_day) < 2:
-                continue
-
-            prev_close = df_day["close"].iloc[-2]
-            last_close = df_day["close"].iloc[-1]
-            value = df_day["value"].iloc[-1]  # 일봉 거래대금
-
-            if prev_close == 0:
-                continue
-
-            change_rate = (last_close / prev_close - 1) * 100.0
-
-            if change_rate > 0 and value >= VOLUME_THRESHOLD:
-                selected.append(ticker)
-        except Exception:
-            # 개별 종목 에러는 무시
-            continue
-
-    universe = selected
-    last_universe_update = datetime.now()
-
-    print(f"[유니버스 업데이트] {len(universe)}개 종목 감시중")
-    print(f"감시 리스트: {universe}")
-
-
-# ======== 현재가 조회 ========
-def get_current_price(ticker):
-    try:
-        return pyupbit.get_current_price(ticker)
-    except Exception:
-        return None
-
-
-# ======== DRY_RUN / REAL 공통: 시장가 매수 ========
-def buy_market(ticker, amount_krw):
-    global virtual_krw, virtual_coin, invested_krw, entry_price_map
-
-    if amount_krw <= 0:
-        return
-
-    price = get_current_price(ticker)
-    if price is None:
-        print(f"[WARN][{ticker}] 현재가 조회 실패, 매수 스킵")
-        return
-
-    fee_rate = 0.0005  # 업비트 수수료 대략 0.05% 가정
-
-    if DRY_RUN:
-        # 가상 매수
-        use_krw = min(virtual_krw, amount_krw)
-        if use_krw < 1000:
-            print(f"[DRY_RUN][{ticker}] 사용 가능한 KRW가 너무 적어서 매수 스킵")
-            return
-
-        buy_krw = use_krw * (1 - fee_rate)
-        qty = buy_krw / price
-
-        virtual_krw -= use_krw
-        virtual_coin[ticker] = virtual_coin.get(ticker, 0.0) + qty
-        invested_krw[ticker] = use_krw  # 수수료 포함 투입금
-        print(f"[DRY_RUN][BUY][{ticker}] {qty:.6f}개 매수 @ {price:.1f}원, "
-              f"사용 KRW: {use_krw:,.0f}, 남은 KRW: {virtual_krw:,.0f}")
-    else:
-        # 실전 매수
-        if amount_krw < 5000:
-            print(f"[REAL][{ticker}] 주문 금액이 5000원 미만, 매수 스킵")
-            return
-        try:
-            order = upbit.buy_market_order(ticker, amount_krw)
-            print(f"[REAL][BUY][{ticker}] 시장가 매수 주문 전송: {order}")
+            return func()
         except Exception as e:
-            print(f"[ERROR][{ticker}] 매수 주문 실패: {e}")
+            last_exception = e
+            if logger:
+                logger.warning(f"{func.__name__} 실패({attempt+1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                time.sleep(now_delay)
+                now_delay *= backoff
+    if logger:
+        logger.error(f"{func.__name__} 최종 실패: {last_exception}")
+    return None
 
 
-# ======== DRY_RUN / REAL 공통: 시장가 매도 ========
-def sell_market(ticker):
-    global virtual_krw, virtual_coin, invested_krw
+def validate_price(price):
+    return price is not None and price > 0 and not np.isnan(price)
 
-    price = get_current_price(ticker)
-    if price is None:
-        print(f"[WARN][{ticker}] 현재가 조회 실패, 매도 스킵")
-        return
 
-    fee_rate = 0.0005
+def validate_dataframe(df, min_length):
+    return df is not None and len(df) >= min_length
 
-    if DRY_RUN:
-        qty = virtual_coin.get(ticker, 0.0)
-        if qty <= 0:
-            print(f"[DRY_RUN][SELL][{ticker}] 보유 코인이 없습니다.")
+
+# ======== 메인 클래스 ========
+class VolatilityBreakoutBot:
+
+    def __init__(self):
+        self.upbit = None
+        self.universe: List[str] = []
+        self.last_universe_update: Optional[datetime] = None
+
+        self.virtual_krw = INITIAL_VIRTUAL_KRW
+        self.virtual_coin: Dict[str, float] = {}
+
+        self.in_position: Dict[str, bool] = {}
+        self.current_bar_time: Dict[str, datetime] = {}
+        self.entry_price_map: Dict[str, Optional[float]] = {}
+        self.invested_krw: Dict[str, float] = {}
+
+        self.total_trades = 0
+        self.win_trades = 0
+        self.total_pnl_krw = 0
+
+        self._price_cache: Dict[str, Tuple[float, datetime]] = {}
+        self._price_cache_ttl = 5
+
+        self.init_upbit()
+        self.load_state()
+
+    # -----------------------
+    #    기본 설정
+    # -----------------------
+    def init_upbit(self):
+        if DRY_RUN:
+            logger.info("DRY_RUN 모드 (모의매매)")
+            self.upbit = None
+        else:
+            self.upbit = pyupbit.Upbit(ACCESS_KEY, SECRET_KEY)
+            logger.info("실전 매매 활성화됨")
+
+    def load_state(self):
+        if not STATE_FILE.exists():
+            return
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                state = json.load(f)
+
+            if DRY_RUN:
+                self.virtual_krw = state.get("virtual_krw", INITIAL_VIRTUAL_KRW)
+                self.virtual_coin = state.get("virtual_coin", {})
+
+            self.in_position = state.get("in_position", {})
+            self.invested_krw = state.get("invested_krw", {})
+            self.entry_price_map = state.get("entry_price_map", {})
+
+            self.total_trades = state.get("total_trades", 0)
+            self.win_trades = state.get("win_trades", 0)
+            self.total_pnl_krw = state.get("total_pnl_krw", 0.0)
+
+            logger.info(f"상태 복구 완료 — 보유KRW {self.virtual_krw:,.0f}")
+        except:
+            logger.error("상태 복구 실패. 새로 시작합니다.")
+
+    def save_state(self):
+        try:
+            state = {
+                "virtual_krw": self.virtual_krw,
+                "virtual_coin": self.virtual_coin,
+                "in_position": self.in_position,
+                "invested_krw": self.invested_krw,
+                "entry_price_map": self.entry_price_map,
+                "total_trades": self.total_trades,
+                "win_trades": self.win_trades,
+                "total_pnl_krw": self.total_pnl_krw,
+                "timestamp": datetime.now().isoformat()
+            }
+            with open(STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump(state, f, indent=2, ensure_ascii=False)
+        except:
+            logger.error("상태 저장 실패")
+
+    # -----------------------
+    #     유니버스 관리
+    # -----------------------
+    def get_current_price(self, ticker, use_cache=True):
+        now = datetime.now()
+
+        if use_cache and ticker in self._price_cache:
+            price, ts = self._price_cache[ticker]
+            if (now - ts).total_seconds() < self._price_cache_ttl:
+                return price
+
+        def func():
+            return pyupbit.get_current_price(ticker)
+
+        price = retry_on_failure(func, logger=logger)
+        if validate_price(price):
+            self._price_cache[ticker] = (price, now)
+        return price
+
+    def build_universe(self):
+        logger.info("유니버스 계산 중...")
+
+        def fetch_tickers():
+            return pyupbit.get_tickers(fiat="KRW")
+
+        tickers = retry_on_failure(fetch_tickers, logger=logger)
+        if not tickers:
+            logger.error("티커 목록 조회 실패")
             return
 
-        sell_krw = qty * price * (1 - fee_rate)
-        buy_krw = invested_krw.get(ticker, 0.0)
+        # Upbit Ticker API (100개씩 호출)
+        def fetch_ticker_data():
+            res = []
+            batch_size = 100
+            for i in range(0, len(tickers), batch_size):
+                url = "https://api.upbit.com/v1/ticker?markets=" + ",".join(
+                    tickers[i:i + batch_size]
+                )
+                r = requests.get(url)
+                r.raise_for_status()
+                res.extend(r.json())
+                time.sleep(0.1)
+            return res
 
-        pnl = sell_krw - buy_krw
-        ret_pct = (pnl / buy_krw * 100.0) if buy_krw > 0 else 0.0
+        data = retry_on_failure(fetch_ticker_data, logger=logger)
+        if not data:
+            logger.error("ticker 데이터 조회 실패")
+            return
 
-        virtual_krw += sell_krw
-        virtual_coin[ticker] = 0.0
-        invested_krw[ticker] = 0.0
+        sel = []
+        for d in data:
+            try:
+                market = d["market"]
+                change_rate = d["signed_change_rate"] * 100
+                acc = d["acc_trade_price_24h"]
 
-        print(f"[DRY_RUN][SELL][{ticker}] {qty:.6f}개 매도 @ {price:.1f}원, "
-              f"수령 KRW: {sell_krw:,.0f}, 이번 트레이드 수익률: {ret_pct:.2f}%")
+                if change_rate > 0 and acc >= VOLUME_THRESHOLD:
+                    sel.append(market)
+            except:
+                continue
 
-        # 현재 가상 총자산
-        total_equity = virtual_krw
-        for tk, q in virtual_coin.items():
-            if q > 0:
-                cp = get_current_price(tk) or 0
-                total_equity += q * cp
+        self.universe = sel
+        self.last_universe_update = datetime.now()
 
-        print(f"[DRY_RUN][{ticker}] 현재 가상 총자산: {total_equity:,.0f}원 "
-              f"(KRW: {virtual_krw:,.0f})")
+        # 콘솔 출력 (깔끔하게)
+        logger.info("====================================================")
+        logger.info(f"🎯 유니버스 업데이트 — {len(sel)}개 종목")
+        for m in sel:
+            logger.info(f"  - {m}")
+        if not sel:
+            logger.info("⚠ 조건 만족 종목 없음")
+        logger.info("====================================================")
 
-    else:
-        # 실전 매도
-        try:
-            balances = upbit.get_balances()
-            coin_symbol = ticker.split("-")[1]
-            coin_balance = 0.0
-            for b in balances:
-                if b['currency'] == coin_symbol:
-                    coin_balance = float(b['balance'])
-                    break
+        self.cleanup_old_positions()
 
-            if coin_balance <= 0:
-                print(f"[REAL][SELL][{ticker}] 보유 코인이 없습니다.")
+    def cleanup_old_positions(self):
+        for t in list(self.in_position.keys()):
+            if t not in self.universe:
+                if DRY_RUN and self.virtual_coin.get(t, 0) > 0:
+                    logger.warning(f"{t} — 유니버스 제외 → 강제 청산")
+                    self.sell_market(t)
+
+                self.in_position.pop(t, None)
+                self.current_bar_time.pop(t, None)
+                self.entry_price_map.pop(t, None)
+
+    # -----------------------
+    #      매수 / 매도
+    # -----------------------
+    def buy_market(self, ticker, amount_krw):
+        price = self.get_current_price(ticker, use_cache=False)
+        if not validate_price(price):
+            return
+
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        fee = 0.0005
+
+        if DRY_RUN:
+            use_krw = min(self.virtual_krw, amount_krw)
+            if use_krw < 1000:
                 return
 
-            order = upbit.sell_market_order(ticker, coin_balance)
-            print(f"[REAL][SELL][{ticker}] 시장가 매도 주문 전송: {order}")
-        except Exception as e:
-            print(f"[ERROR][{ticker}] 매도 주문 실패: {e}")
+            qty = (use_krw * (1 - fee)) / price
+            self.virtual_krw -= use_krw
+            self.virtual_coin[ticker] = self.virtual_coin.get(ticker, 0) + qty
+            self.invested_krw[ticker] = use_krw
 
+            logger.info(
+                f"[BUY] {now} | {ticker}\n"
+                f"  가격 {price:,.0f}원 | 수량 {qty:.6f}개 | KRW {use_krw:,.0f}"
+            )
 
-# ======== 각 종목별 전략 처리 ========
-def process_symbol(ticker):
-    """
-    종목 하나에 대해:
-      - 직전 캔들로 entry_price 계산
-      - 현재 진행 중인 캔들의 고가가 entry_price 돌파하면 매수
-      - 새 캔들이 시작되면, 이전 캔들에서 진입한 포지션은 매도
-    """
-    global current_bar_time, entry_price_map, in_position
-
-    try:
-        df = pyupbit.get_ohlcv(ticker, interval=INTERVAL, count=60)
-    except Exception:
-        print(f"[WARN][{ticker}] OHLCV 조회 실패, 스킵")
-        return
-
-    if df is None or len(df) < 40:
-        # 이동평균 계산에 필요한 최소 갯수 부족
-        return
-
-    # 이동평균 계산
-    df["sma5"] = df["close"].rolling(5).mean()
-    df["sma10"] = df["close"].rolling(10).mean()
-    df["sma20"] = df["close"].rolling(20).mean()
-    df["sma40"] = df["close"].rolling(40).mean()
-
-    # 마지막 캔들: 현재 진행중인 캔들 (실시간)
-    # 마지막에서 두 번째 캔들: 완전히 끝난 직전 캔들
-    prev = df.iloc[-2]
-    curr = df.iloc[-1]
-
-    prev_time = prev.name
-    curr_time = curr.name
-
-    # ===== 1) 새 캔들이 시작되었는지 체크 =====
-    stored_time = current_bar_time.get(ticker)
-
-    if stored_time is None or curr_time != stored_time:
-        # (1) 이전 캔들에서 포지션이 있었다면 → 지금 시점(새 캔들 시작)에 매도
-        if in_position.get(ticker, False):
-            print(f"[INFO][{ticker}] 새 캔들 시작 감지 → 이전 캔들 포지션 청산")
-            sell_market(ticker)
-            in_position[ticker] = False
-
-        # (2) 이번에 새로 모니터링할 캔들의 시간 갱신
-        current_bar_time[ticker] = curr_time
-
-        # (3) 이번 캔들에서 사용할 entry_price 계산 (직전 캔들 기준)
-        sma5_prev = prev["sma5"]
-        sma10_prev = prev["sma10"]
-        sma20_prev = prev["sma20"]
-        sma40_prev = prev["sma40"]
-
-        if np.isnan(sma40_prev):
-            entry_price_map[ticker] = None
+            self.save_state()
             return
 
-        is_ma_aligned = (
-            sma5_prev > sma10_prev
-            and sma10_prev > sma20_prev
-            and sma20_prev > sma40_prev
+    def sell_market(self, ticker):
+        price = self.get_current_price(ticker, use_cache=False)
+        if not validate_price(price):
+            return
+
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        qty = self.virtual_coin.get(ticker, 0)
+        if qty <= 0:
+            return
+
+        fee = 0.0005
+        sell_krw = qty * price * (1 - fee)
+        buy_krw = self.invested_krw.get(ticker, 0)
+
+        pnl = sell_krw - buy_krw
+        ret_pct = pnl / buy_krw * 100 if buy_krw > 0 else 0
+
+        self.virtual_krw += sell_krw
+        self.virtual_coin[ticker] = 0
+        self.invested_krw[ticker] = 0
+        self.entry_price_map[ticker] = None
+
+        self.total_trades += 1
+        if pnl > 0:
+            self.win_trades += 1
+        self.total_pnl_krw += pnl
+
+        win_rate = self.win_trades / self.total_trades * 100 if self.total_trades > 0 else 0
+        total_equity = self.virtual_krw
+        total_return_pct = (total_equity / INITIAL_VIRTUAL_KRW - 1) * 100
+
+        logger.info(
+            f"[SELL] {now} | {ticker}\n"
+            f"  가격 {price:,.0f}원 | 수익률 {ret_pct:+.2f}% | PnL {pnl:,.0f}\n"
+            f"  총 자산 {total_equity:,.0f}원 | 누적수익률 {total_return_pct:+.2f}% | 승률 {win_rate:.2f}%"
         )
 
-        if is_ma_aligned:
-            range_prev = prev["high"] - prev["low"]
-            entry_price = prev["close"] + range_prev * (K * K)
-            entry_price_map[ticker] = entry_price
-            print(f"[INFO][{ticker}] 새 캔들 시작, 정배열 ON, entry_price = {entry_price:.1f}")
-        else:
-            entry_price_map[ticker] = None
-            print(f"[INFO][{ticker}] 새 캔들 시작, 정배열 아님 → 이번 캔들 매수 안 함")
-            return
+        self.save_state()
 
-    # ===== 2) 현재 캔들에서 돌파 발생 여부 체크 =====
-    # 여기까지 왔다는 건: current_bar_time[ticker] == curr_time 인 상태
-    if not in_position.get(ticker, False):
-        entry_price = entry_price_map.get(ticker)
-        if entry_price is None:
-            return
-
-        current_high = curr["high"]   # 현재 진행중인 캔들의 고가
-        if current_high >= entry_price:
-            # 돌파 발생 → 시장가 매수
-            if DRY_RUN:
-                amount_krw = virtual_krw * ORDER_KRW_PORTION
-            else:
-                balances = upbit.get_balances()
-                krw_balance = 0.0
-                for b in balances:
-                    if b['currency'] == 'KRW':
-                        krw_balance = float(b['balance'])
-                        break
-                amount_krw = krw_balance * ORDER_KRW_PORTION
-
-            print(f"[SIGNAL][{ticker}] 변동성 돌파 발생! high={current_high:.1f}, entry={entry_price:.1f}")
-            buy_market(ticker, amount_krw)
-            in_position[ticker] = True
-    else:
-        # 이미 포지션 보유 중이면, 이 캔들 끝날 때까지 그냥 보유
-        pass
-
-
-# ======== 메인 루프 ========
-def main():
-    global last_universe_update
-
-    init_upbit()
-
-    print(f"[START] 변동성 돌파 + 정배열 + 유니버스 필터 자동매매 시작")
-    print(f"        INTERVAL={INTERVAL}, DRY_RUN={DRY_RUN}")
-    print(f"        초기 가상 KRW: {INITIAL_VIRTUAL_KRW:,.0f}원")
-
-    # 최초 유니버스 생성
-    build_universe()
-
-    while True:
+    # -----------------------
+    #       전략 로직
+    # -----------------------
+    def process_symbol(self, ticker):
         try:
-            now = datetime.now()
+            df = retry_on_failure(
+                lambda: pyupbit.get_ohlcv(ticker, interval=INTERVAL, count=40),
+                logger=logger
+            )
+            if not validate_dataframe(df, 20):
+                return
 
-            # 일정 시간마다 유니버스 재계산
-            if (last_universe_update is None) or \
-               ((now - last_universe_update) > timedelta(minutes=UNIVERSE_REFRESH_MIN)):
-                build_universe()
+            prev = df.iloc[-2]
+            curr = df.iloc[-1]
+            curr_time = curr.name
 
-            if not universe:
-                print("[INFO] 유니버스에 종목이 없습니다. 잠시 대기.")
-                time.sleep(SLEEP_SEC)
-                continue
+            # 1) 새 캔들 시작 → 매도
+            stored_time = self.current_bar_time.get(ticker)
+            if stored_time is None or curr_time != stored_time:
+                if self.in_position.get(ticker, False):
+                    self.sell_market(ticker)
+                    self.in_position[ticker] = False
+                self.current_bar_time[ticker] = curr_time
 
-            # 유니버스 종목들 순회
-            for ticker in universe:
-                process_symbol(ticker)
+            # 2) 매수 조건 (변동성 돌파 ONLY)
+            if not self.in_position.get(ticker, False):
 
-            time.sleep(SLEEP_SEC)
+                # 변동폭
+                range_prev = prev["high"] - prev["low"]
+                if range_prev <= 0:
+                    return
+
+                entry_price = curr["open"] + range_prev * K
+                current_price = curr["close"]
+
+                if not validate_price(entry_price) or not validate_price(current_price):
+                    return
+
+                logger.debug(f"[{ticker}] 현재가={current_price:.0f}, 기준가={entry_price:.0f}")
+
+                # ---- 변동성 돌파 ----
+                if current_price >= entry_price:
+
+                    if DRY_RUN:
+                        amount_krw = self.virtual_krw * ORDER_KRW_PORTION
+                    else:
+                        balances = retry_on_failure(self.upbit.get_balances, logger=logger)
+                        krw = 0
+                        for b in balances:
+                            if b["currency"] == "KRW":
+                                krw = float(b["balance"])
+                        amount_krw = krw * ORDER_KRW_PORTION
+
+                    self.buy_market(ticker, amount_krw)
+                    self.in_position[ticker] = True
+                    self.entry_price_map[ticker] = float(entry_price)
 
         except Exception as e:
-            print(f"[ERROR] 메인 루프 에러: {e}")
-            time.sleep(SLEEP_SEC)
+            logger.error(f"[{ticker}] process 오류: {e}", exc_info=True)
+
+    # -----------------------
+    #        메인 루프
+    # -----------------------
+    def run(self):
+        logger.info("변동성 돌파 자동매매 시작")
+
+        # 초기 유니버스 구축
+        self.build_universe()
+
+        while True:
+            try:
+                now = datetime.now()
+
+                # 유니버스 주기 갱신
+                if (self.last_universe_update is None or
+                        (now - self.last_universe_update).seconds >= UNIVERSE_REFRESH_MIN * 60):
+                    self.build_universe()
+
+                if not self.universe:
+                    time.sleep(30)
+                    continue
+
+                # 종목별 매매 처리
+                for t in self.universe:
+                    self.process_symbol(t)
+                    time.sleep(0.1)
+
+                self.save_state()
+                time.sleep(SLEEP_SEC)
+
+            except KeyboardInterrupt:
+                logger.info("사용자 종료 요청 → 저장 후 종료")
+                self.save_state()
+                break
+            except Exception as e:
+                logger.error(f"메인루프 오류: {e}", exc_info=True)
+                time.sleep(SLEEP_SEC)
+
+
+# ======== 시작점 ========
+def main():
+    try:
+        bot = VolatilityBreakoutBot()
+        bot.run()
+    except Exception as e:
+        logger.critical(f"치명적 오류: {e}", exc_info=True)
 
 
 if __name__ == "__main__":
