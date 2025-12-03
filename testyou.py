@@ -33,6 +33,10 @@ TOP_GAINERS_COUNT = 20  # Top N gainers
 MONITOR_INTERVAL = 300  # Monitoring interval in seconds (5 minutes)
 INVESTMENT_PER_COIN = 0.95  # Investment ratio per coin (95% of balance)
 
+# Trading interval settings
+# Options: "minute1", "minute3", "minute5", "minute10", "minute15", "minute30", "minute60", "minute240", "day", "week", "month"
+CANDLE_INTERVAL = "minute5"  # Candle interval for technical analysis
+
 
 class UpbitAutoTrader:
     def __init__(self, access_key, secret_key, dry_run=True):
@@ -158,7 +162,7 @@ class UpbitAutoTrader:
         """
         try:
             # Get sufficient data for ADX calculation
-            df = pyupbit.get_ohlcv(ticker, interval="minute5", count=200)
+            df = pyupbit.get_ohlcv(ticker, interval=CANDLE_INTERVAL, count=200)
 
             if df is None or len(df) < 50:
                 return False
@@ -205,7 +209,7 @@ class UpbitAutoTrader:
         (ADX declining for 3 consecutive candles)
         """
         try:
-            df = pyupbit.get_ohlcv(ticker, interval="minute5", count=200)
+            df = pyupbit.get_ohlcv(ticker, interval=CANDLE_INTERVAL, count=200)
 
             if df is None or len(df) < 50:
                 return False
@@ -573,11 +577,20 @@ class UpbitAutoTrader:
 
     def run(self):
         """Main execution loop"""
+        # Convert interval to Korean display
+        interval_display = {
+            "minute1": "1분봉", "minute3": "3분봉", "minute5": "5분봉",
+            "minute10": "10분봉", "minute15": "15분봉", "minute30": "30분봉",
+            "minute60": "60분봉", "minute240": "240분봉",
+            "day": "일봉", "week": "주봉", "month": "월봉"
+        }
+
         logger.info("\n" + "=" * 70)
         logger.info("=== 업비트 자동매매 봇 시작 ===")
         logger.info("=" * 70)
         logger.info(f"모드: {'모의매매 (DRY RUN)' if self.dry_run else '실전매매 (LIVE)'}")
-        logger.info(f"모니터링 주기: {MONITOR_INTERVAL}초 (5분)")
+        logger.info(f"차트 분석 주기: {interval_display.get(CANDLE_INTERVAL, CANDLE_INTERVAL)}")
+        logger.info(f"모니터링 주기: {MONITOR_INTERVAL}초")
         logger.info(f"최소 거래대금: {MIN_VOLUME/100000000:.0f}억원")
         logger.info(f"상위 종목 수: {TOP_GAINERS_COUNT}개")
         logger.info("=" * 70 + "\n")
