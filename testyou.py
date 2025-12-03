@@ -44,10 +44,12 @@ class UpbitAutoTrader:
         # Virtual portfolio for dry run mode
         if self.dry_run:
             self.virtual_krw_balance = INITIAL_BALANCE
-            self.virtual_portfolio = {}  # {ticker: amount}
+            self.virtual_portfolio = {}  # {ticker: {amount, avg_buy_price}}
             self.trade_history = []  # Track all trades
-            logger.info(f"*** DRY RUN MODE ENABLED - NO REAL TRADES WILL BE EXECUTED ***")
-            logger.info(f"Initial virtual balance: {self.virtual_krw_balance:,.0f} KRW")
+            self.win_count = 0
+            self.lose_count = 0
+            logger.info(f"*** 모의매매 모드 활성화 - 실제 거래가 체결되지 않습니다 ***")
+            logger.info(f"초기 가상 자본금: {self.virtual_krw_balance:,.0f}원")
 
     def get_top_gainers(self):
         """Get top gainers by daily change rate with volume filter (optimized with batch API call)"""
@@ -95,15 +97,15 @@ class UpbitAutoTrader:
             market_data.sort(key=lambda x: x['change_rate'], reverse=True)
             top_coins = market_data[:TOP_GAINERS_COUNT]
 
-            logger.info(f"Top {TOP_GAINERS_COUNT} gainers with volume >= {MIN_VOLUME/100000000:.0f} billion KRW:")
+            logger.info(f"거래대금 {MIN_VOLUME/100000000:.0f}억원 이상 상승률 TOP {TOP_GAINERS_COUNT}:")
             for coin in top_coins:
-                logger.info(f"  {coin['ticker']}: {coin['change_rate']:.2f}%, "
-                          f"Volume: {coin['volume_krw']/100000000:.0f} billion KRW")
+                logger.info(f"  {coin['ticker']}: 상승률 {coin['change_rate']:+.2f}%, "
+                          f"거래대금: {coin['volume_krw']/100000000:.0f}억원")
 
             return [coin['ticker'] for coin in top_coins]
 
         except Exception as e:
-            logger.error(f"Error in get_top_gainers: {e}")
+            logger.error(f"상위 종목 조회 중 오류 발생: {e}")
             return []
 
     def calculate_sma(self, df, period):
@@ -185,16 +187,15 @@ class UpbitAutoTrader:
             result = condition1 and condition2 and condition3
 
             if result:
-                logger.info(f"Buy signal for {ticker}: SMA5={latest['sma5']:.2f}, "
-                          f"SMA10={latest['sma10']:.2f}, SMA20={latest['sma20']:.2f}, "
-                          f"SMA40={latest['sma40']:.2f}, SMA40[1]={prev_sma40:.2f}, "
-                          f"DI+={latest['plus_di']:.2f}, ADX={latest['adx']:.2f}, "
-                          f"DI-={latest['minus_di']:.2f}")
+                logger.info(f"매수 시그널 발생 - {ticker}")
+                logger.info(f"  SMA5={latest['sma5']:.2f}, SMA10={latest['sma10']:.2f}, SMA20={latest['sma20']:.2f}")
+                logger.info(f"  SMA40={latest['sma40']:.2f}, SMA40[1]={prev_sma40:.2f}")
+                logger.info(f"  DI+={latest['plus_di']:.2f}, ADX={latest['adx']:.2f}, DI-={latest['minus_di']:.2f}")
 
             return result
 
         except Exception as e:
-            logger.error(f"Error checking buy condition for {ticker}: {e}")
+            logger.error(f"매수 조건 확인 중 오류 ({ticker}): {e}")
             return False
 
     def check_sell_condition(self, ticker):
@@ -224,13 +225,13 @@ class UpbitAutoTrader:
             result = (adx_0 < adx_1) and (adx_1 < adx_2) and (adx_2 < adx_3)
 
             if result:
-                logger.info(f"Sell signal for {ticker}: ADX={adx_0:.2f}, "
-                          f"ADX[1]={adx_1:.2f}, ADX[2]={adx_2:.2f}, ADX[3]={adx_3:.2f}")
+                logger.info(f"매도 시그널 발생 - {ticker}")
+                logger.info(f"  ADX={adx_0:.2f}, ADX[1]={adx_1:.2f}, ADX[2]={adx_2:.2f}, ADX[3]={adx_3:.2f}")
 
             return result
 
         except Exception as e:
-            logger.error(f"Error checking sell condition for {ticker}: {e}")
+            logger.error(f"매도 조건 확인 중 오류 ({ticker}): {e}")
             return False
 
     def get_balance(self, ticker=None):
@@ -241,7 +242,8 @@ class UpbitAutoTrader:
                 if ticker is None:
                     return self.virtual_krw_balance
                 else:
-                    return self.virtual_portfolio.get(ticker, 0)
+                    portfolio = self.virtual_portfolio.get(ticker, {})
+                    return portfolio.get('amount', 0)
             else:
                 # Real balance
                 if ticker is None:
@@ -250,7 +252,7 @@ class UpbitAutoTrader:
                     coin = ticker.split('-')[1]
                     return self.upbit.get_balance(coin)
         except Exception as e:
-            logger.error(f"Error getting balance for {ticker}: {e}")
+            logger.error(f"잔고 조회 중 오류 ({ticker}): {e}")
             return 0
 
     def buy_coin(self, ticker):
@@ -259,7 +261,7 @@ class UpbitAutoTrader:
             krw_balance = self.get_balance()
 
             if krw_balance < 5000:  # Minimum order amount
-                logger.warning(f"Insufficient KRW balance: {krw_balance}")
+                logger.warning(f"잔고 부족: {krw_balance:,.0f}원")
                 return False
 
             # Check current holdings
@@ -269,20 +271,35 @@ class UpbitAutoTrader:
             buy_amount = krw_balance * INVESTMENT_PER_COIN
 
             if buy_amount < 5000:
-                logger.warning(f"Buy amount too small: {buy_amount}")
+                logger.warning(f"매수 금액이 너무 작음: {buy_amount:,.0f}원")
                 return False
 
             # Get current price
             current_price = pyupbit.get_current_price(ticker)
             if current_price is None:
-                logger.warning(f"Cannot get price for {ticker}")
+                logger.warning(f"현재가 조회 실패: {ticker}")
                 return False
 
             if self.dry_run:
                 # Virtual buy for dry run
                 coin_amount = buy_amount / current_price
                 self.virtual_krw_balance -= buy_amount
-                self.virtual_portfolio[ticker] = self.virtual_portfolio.get(ticker, 0) + coin_amount
+
+                # Update portfolio with average buy price
+                if ticker in self.virtual_portfolio:
+                    existing = self.virtual_portfolio[ticker]
+                    total_amount = existing['amount'] + coin_amount
+                    avg_price = ((existing['amount'] * existing['avg_buy_price']) +
+                                (coin_amount * current_price)) / total_amount
+                    self.virtual_portfolio[ticker] = {
+                        'amount': total_amount,
+                        'avg_buy_price': avg_price
+                    }
+                else:
+                    self.virtual_portfolio[ticker] = {
+                        'amount': coin_amount,
+                        'avg_buy_price': current_price
+                    }
 
                 # Record trade
                 trade = {
@@ -295,24 +312,34 @@ class UpbitAutoTrader:
                 }
                 self.trade_history.append(trade)
 
-                logger.info(f"[DRY RUN] BUY SUCCESS: {ticker}, "
-                          f"Amount: {coin_amount:.4f} coins, "
-                          f"Price: {current_price:,.0f} KRW, "
-                          f"Total: {buy_amount:.0f} KRW")
+                # Calculate current win rate
+                total_trades = self.win_count + self.lose_count
+                win_rate = (self.win_count / total_trades * 100) if total_trades > 0 else 0
+
+                logger.info(f"{'='*60}")
+                logger.info(f"[모의매매] 매수 체결")
+                logger.info(f"  종목: {ticker}")
+                logger.info(f"  시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                logger.info(f"  가격: {current_price:,.0f}원")
+                logger.info(f"  수량: {coin_amount:.4f}개")
+                logger.info(f"  금액: {buy_amount:,.0f}원")
+                logger.info(f"  평균단가: {self.virtual_portfolio[ticker]['avg_buy_price']:,.0f}원")
+                logger.info(f"  현재 승률: {win_rate:.1f}% ({self.win_count}승 {self.lose_count}패)")
+                logger.info(f"{'='*60}")
                 return True
             else:
                 # Real buy
                 result = self.upbit.buy_market_order(ticker, buy_amount)
 
                 if result:
-                    logger.info(f"BUY SUCCESS: {ticker}, Amount: {buy_amount:.0f} KRW")
+                    logger.info(f"[실전매매] 매수 체결: {ticker}, 금액: {buy_amount:,.0f}원")
                     return True
                 else:
-                    logger.warning(f"BUY FAILED: {ticker}")
+                    logger.warning(f"매수 실패: {ticker}")
                     return False
 
         except Exception as e:
-            logger.error(f"Error buying {ticker}: {e}")
+            logger.error(f"매수 중 오류 발생 ({ticker}): {e}")
             return False
 
     def sell_coin(self, ticker):
@@ -330,6 +357,23 @@ class UpbitAutoTrader:
             sell_value = balance * current_price
 
             if self.dry_run:
+                # Get average buy price
+                portfolio = self.virtual_portfolio.get(ticker, {})
+                avg_buy_price = portfolio.get('avg_buy_price', current_price)
+                buy_value = balance * avg_buy_price
+
+                # Calculate profit/loss
+                profit = sell_value - buy_value
+                profit_rate = (profit / buy_value) * 100 if buy_value > 0 else 0
+
+                # Update win/lose count
+                if profit > 0:
+                    self.win_count += 1
+                    result_text = "익절"
+                else:
+                    self.lose_count += 1
+                    result_text = "손절"
+
                 # Virtual sell for dry run
                 self.virtual_krw_balance += sell_value
 
@@ -340,7 +384,10 @@ class UpbitAutoTrader:
                     'ticker': ticker,
                     'amount': balance,
                     'price': current_price,
-                    'value': sell_value
+                    'value': sell_value,
+                    'buy_price': avg_buy_price,
+                    'profit': profit,
+                    'profit_rate': profit_rate
                 }
                 self.trade_history.append(trade)
 
@@ -348,25 +395,35 @@ class UpbitAutoTrader:
                 if ticker in self.virtual_portfolio:
                     del self.virtual_portfolio[ticker]
 
-                logger.info(f"[DRY RUN] SELL SUCCESS: {ticker}, "
-                          f"Amount: {balance:.4f} coins, "
-                          f"Price: {current_price:,.0f} KRW, "
-                          f"Total: {sell_value:.0f} KRW")
+                # Calculate current win rate
+                total_trades = self.win_count + self.lose_count
+                win_rate = (self.win_count / total_trades * 100) if total_trades > 0 else 0
+
+                logger.info(f"{'='*60}")
+                logger.info(f"[모의매매] 매도 체결 ({result_text})")
+                logger.info(f"  종목: {ticker}")
+                logger.info(f"  시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                logger.info(f"  매수가: {avg_buy_price:,.0f}원")
+                logger.info(f"  매도가: {current_price:,.0f}원")
+                logger.info(f"  수량: {balance:.4f}개")
+                logger.info(f"  매도금액: {sell_value:,.0f}원")
+                logger.info(f"  손익: {profit:+,.0f}원 ({profit_rate:+.2f}%)")
+                logger.info(f"  현재 승률: {win_rate:.1f}% ({self.win_count}승 {self.lose_count}패)")
+                logger.info(f"{'='*60}")
                 return True
             else:
                 # Real sell
                 result = self.upbit.sell_market_order(ticker, balance)
 
                 if result:
-                    logger.info(f"SELL SUCCESS: {ticker}, Amount: {balance}, "
-                              f"Value: {sell_value:.0f} KRW")
+                    logger.info(f"[실전매매] 매도 체결: {ticker}, 금액: {sell_value:,.0f}원")
                     return True
                 else:
-                    logger.warning(f"SELL FAILED: {ticker}")
+                    logger.warning(f"매도 실패: {ticker}")
                     return False
 
         except Exception as e:
-            logger.error(f"Error selling {ticker}: {e}")
+            logger.error(f"매도 중 오류 발생 ({ticker}): {e}")
             return False
 
     def update_target_coins(self):
@@ -378,15 +435,15 @@ class UpbitAutoTrader:
             if ticker not in new_targets:
                 balance = self.get_balance(ticker)
                 if balance > 0:
-                    logger.info(f"{ticker} removed from target list. Selling...")
+                    logger.info(f"{ticker} 매매대상에서 제외됨 - 전량 매도 진행...")
                     self.sell_coin(ticker)
 
         self.target_coins = new_targets
-        logger.info(f"Updated target coins: {len(self.target_coins)} coins")
+        logger.info(f"매매 대상 종목 업데이트 완료: 총 {len(self.target_coins)}개")
 
     def monitor_and_trade(self):
         """Monitor and execute trades"""
-        logger.info("=== Monitoring and Trading ===")
+        logger.info("=== 매매 모니터링 및 실행 ===")
 
         # Check holdings and sell/buy conditions
         for ticker in self.target_coins:
@@ -395,12 +452,12 @@ class UpbitAutoTrader:
             if balance > 0:
                 # Holding coin - check sell condition
                 if self.check_sell_condition(ticker):
-                    logger.info(f"Sell condition met for {ticker}")
+                    logger.info(f"매도 조건 충족: {ticker}")
                     self.sell_coin(ticker)
             else:
                 # Not holding - check buy condition
                 if self.check_buy_condition(ticker):
-                    logger.info(f"Buy condition met for {ticker}")
+                    logger.info(f"매수 조건 충족: {ticker}")
                     self.buy_coin(ticker)
 
         # Print current portfolio
@@ -408,61 +465,95 @@ class UpbitAutoTrader:
 
     def print_portfolio(self):
         """Print current portfolio"""
-        logger.info("=== Current Portfolio ===")
+        logger.info("\n" + "=" * 60)
+        logger.info("=== 현재 포트폴리오 ===")
+        logger.info("=" * 60)
+
         krw_balance = self.get_balance()
-        logger.info(f"KRW Balance: {krw_balance:,.0f} KRW")
+        logger.info(f"현금 잔고: {krw_balance:,.0f}원")
 
         total_value = krw_balance
+        total_profit = 0
 
-        for ticker in self.target_coins:
-            balance = self.get_balance(ticker)
-            if balance > 0:
+        if self.dry_run and self.virtual_portfolio:
+            logger.info(f"\n보유 종목:")
+            for ticker in self.virtual_portfolio:
+                portfolio = self.virtual_portfolio[ticker]
+                balance = portfolio['amount']
+                avg_buy_price = portfolio['avg_buy_price']
+
                 current_price = pyupbit.get_current_price(ticker)
                 if current_price:
                     value = balance * current_price
-                    total_value += value
-                    logger.info(f"  {ticker}: {balance:.4f} coins, "
-                              f"Value: {value:,.0f} KRW")
+                    buy_value = balance * avg_buy_price
+                    profit = value - buy_value
+                    profit_rate = (profit / buy_value * 100) if buy_value > 0 else 0
 
-        logger.info(f"Total Portfolio Value: {total_value:,.0f} KRW")
+                    total_value += value
+                    total_profit += profit
+
+                    logger.info(f"  {ticker}:")
+                    logger.info(f"    수량: {balance:.4f}개")
+                    logger.info(f"    평단가: {avg_buy_price:,.0f}원")
+                    logger.info(f"    현재가: {current_price:,.0f}원")
+                    logger.info(f"    평가금액: {value:,.0f}원")
+                    logger.info(f"    평가손익: {profit:+,.0f}원 ({profit_rate:+.2f}%)")
+
+        logger.info(f"\n" + "-" * 60)
+        logger.info(f"총 평가금액: {total_value:,.0f}원")
 
         # Show P&L for dry run mode
         if self.dry_run:
             pnl = total_value - INITIAL_BALANCE
             pnl_percent = (pnl / INITIAL_BALANCE) * 100
-            logger.info(f"P&L: {pnl:+,.0f} KRW ({pnl_percent:+.2f}%)")
-            logger.info(f"Total Trades: {len(self.trade_history)}")
+            total_trades = self.win_count + self.lose_count
+            win_rate = (self.win_count / total_trades * 100) if total_trades > 0 else 0
 
-        logger.info("=" * 50)
+            logger.info(f"총 손익: {pnl:+,.0f}원 ({pnl_percent:+.2f}%)")
+            logger.info(f"실현 손익: {pnl - total_profit:+,.0f}원")
+            logger.info(f"미실현 손익: {total_profit:+,.0f}원")
+            logger.info(f"총 거래 횟수: {len(self.trade_history)}회 (매수/매도 포함)")
+            logger.info(f"승률: {win_rate:.1f}% ({self.win_count}승 {self.lose_count}패)")
+
+        logger.info("=" * 60 + "\n")
 
     def print_trade_summary(self):
         """Print trade history summary (for dry run mode)"""
         if not self.dry_run or len(self.trade_history) == 0:
             return
 
-        logger.info("\n" + "=" * 60)
-        logger.info("=== TRADING SUMMARY ===")
-        logger.info("=" * 60)
+        logger.info("\n" + "=" * 70)
+        logger.info("=== 거래 내역 요약 ===")
+        logger.info("=" * 70)
 
         buy_count = sum(1 for t in self.trade_history if t['type'] == 'BUY')
         sell_count = sum(1 for t in self.trade_history if t['type'] == 'SELL')
 
-        logger.info(f"Total Trades: {len(self.trade_history)} (Buy: {buy_count}, Sell: {sell_count})")
-        logger.info(f"\nRecent Trades:")
+        logger.info(f"총 거래 횟수: {len(self.trade_history)}회 (매수: {buy_count}회, 매도: {sell_count}회)")
+        logger.info(f"\n최근 거래 내역:")
 
-        # Show last 10 trades
-        for trade in self.trade_history[-10:]:
-            logger.info(f"  {trade['time'].strftime('%Y-%m-%d %H:%M:%S')} - "
-                      f"{trade['type']:4s} {trade['ticker']:12s} "
-                      f"{trade['amount']:.4f} @ {trade['price']:,.0f} = "
-                      f"{trade['value']:,.0f} KRW")
+        # Show last 20 trades
+        for trade in self.trade_history[-20:]:
+            trade_type = "매수" if trade['type'] == 'BUY' else "매도"
+            time_str = trade['time'].strftime('%Y-%m-%d %H:%M:%S')
+
+            if trade['type'] == 'SELL' and 'profit_rate' in trade:
+                logger.info(f"  [{time_str}] {trade_type:2s} {trade['ticker']:12s} "
+                          f"{trade['amount']:>10.4f}개 @ {trade['price']:>10,.0f}원 = "
+                          f"{trade['value']:>12,.0f}원 "
+                          f"(손익: {trade['profit']:+,.0f}원 / {trade['profit_rate']:+.2f}%)")
+            else:
+                logger.info(f"  [{time_str}] {trade_type:2s} {trade['ticker']:12s} "
+                          f"{trade['amount']:>10.4f}개 @ {trade['price']:>10,.0f}원 = "
+                          f"{trade['value']:>12,.0f}원")
 
         # Calculate final P&L
         krw_balance = self.get_balance()
         total_value = krw_balance
 
         for ticker in self.virtual_portfolio:
-            balance = self.virtual_portfolio[ticker]
+            portfolio = self.virtual_portfolio[ticker]
+            balance = portfolio['amount']
             if balance > 0:
                 current_price = pyupbit.get_current_price(ticker)
                 if current_price:
@@ -470,29 +561,35 @@ class UpbitAutoTrader:
 
         final_pnl = total_value - INITIAL_BALANCE
         final_pnl_percent = (final_pnl / INITIAL_BALANCE) * 100
+        win_rate = (self.win_count / (self.win_count + self.lose_count) * 100) if (self.win_count + self.lose_count) > 0 else 0
 
-        logger.info(f"\n=== FINAL RESULTS ===")
-        logger.info(f"Initial Balance: {INITIAL_BALANCE:,.0f} KRW")
-        logger.info(f"Final Value: {total_value:,.0f} KRW")
-        logger.info(f"Total P&L: {final_pnl:+,.0f} KRW ({final_pnl_percent:+.2f}%)")
-        logger.info("=" * 60)
+        logger.info(f"\n" + "=" * 70)
+        logger.info(f"=== 최종 결과 ===")
+        logger.info(f"초기 자본금: {INITIAL_BALANCE:,.0f}원")
+        logger.info(f"최종 평가금액: {total_value:,.0f}원")
+        logger.info(f"총 손익: {final_pnl:+,.0f}원 ({final_pnl_percent:+.2f}%)")
+        logger.info(f"최종 승률: {win_rate:.1f}% ({self.win_count}승 {self.lose_count}패)")
+        logger.info("=" * 70)
 
     def run(self):
         """Main execution loop"""
-        logger.info("=== Upbit Auto Trading Bot Started ===")
-        logger.info(f"Mode: {'DRY RUN (Paper Trading)' if self.dry_run else 'LIVE TRADING'}")
-        logger.info(f"Monitor Interval: {MONITOR_INTERVAL} seconds")
-        logger.info(f"Min Volume: {MIN_VOLUME/100000000:.0f} billion KRW")
-        logger.info(f"Top Gainers: {TOP_GAINERS_COUNT}")
+        logger.info("\n" + "=" * 70)
+        logger.info("=== 업비트 자동매매 봇 시작 ===")
+        logger.info("=" * 70)
+        logger.info(f"모드: {'모의매매 (DRY RUN)' if self.dry_run else '실전매매 (LIVE)'}")
+        logger.info(f"모니터링 주기: {MONITOR_INTERVAL}초 (5분)")
+        logger.info(f"최소 거래대금: {MIN_VOLUME/100000000:.0f}억원")
+        logger.info(f"상위 종목 수: {TOP_GAINERS_COUNT}개")
+        logger.info("=" * 70 + "\n")
 
         iteration = 0
 
         while True:
             try:
                 iteration += 1
-                logger.info(f"\n{'='*60}")
-                logger.info(f"Iteration #{iteration} - {datetime.now()}")
-                logger.info(f"{'='*60}")
+                logger.info(f"\n{'='*70}")
+                logger.info(f"반복 #{iteration} - {datetime.now().strftime('%Y년 %m월 %d일 %H:%M:%S')}")
+                logger.info(f"{'='*70}\n")
 
                 # Update target coins list
                 self.update_target_coins()
@@ -501,15 +598,15 @@ class UpbitAutoTrader:
                 self.monitor_and_trade()
 
                 # Wait
-                logger.info(f"Waiting {MONITOR_INTERVAL} seconds...\n")
+                logger.info(f"\n다음 실행까지 {MONITOR_INTERVAL}초 대기 중...\n")
                 time.sleep(MONITOR_INTERVAL)
 
             except KeyboardInterrupt:
-                logger.info("\nBot stopped by user")
+                logger.info("\n\n사용자에 의해 봇이 중지되었습니다.")
                 break
             except Exception as e:
-                logger.error(f"Error in main loop: {e}")
-                logger.info(f"Waiting {MONITOR_INTERVAL} seconds before retry...")
+                logger.error(f"메인 루프 오류 발생: {e}")
+                logger.info(f"{MONITOR_INTERVAL}초 후 재시도합니다...")
                 time.sleep(MONITOR_INTERVAL)
 
         # Print final summary when bot stops
@@ -521,11 +618,11 @@ def main():
     # Check API keys (not required for dry run mode)
     if not DRY_RUN:
         if ACCESS_KEY == "your_access_key" or API_SECRET == "your_secret_key":
-            logger.error("Please set your Upbit API keys in the script!")
-            logger.error("You can get API keys from: https://upbit.com/mypage/open_api_management")
+            logger.error("업비트 API 키를 설정해주세요!")
+            logger.error("API 키 발급: https://upbit.com/mypage/open_api_management")
             return
     else:
-        logger.info("Running in DRY RUN mode - API keys not required")
+        logger.info("모의매매 모드로 실행 중 - API 키가 필요하지 않습니다")
 
     # Run auto-trading bot
     trader = UpbitAutoTrader(ACCESS_KEY, API_SECRET, dry_run=DRY_RUN)
