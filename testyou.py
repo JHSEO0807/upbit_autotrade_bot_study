@@ -223,12 +223,13 @@ class UpbitAutoTrader:
     def check_buy_condition(self, ticker):
         """
         Check buy conditions:
-        - SMA5 > SMA10 > SMA20
+        - SMA5 > SMA5[1]
+        - SMA10 > SMA10[1]
+        - SMA20 > SMA20[1]
         - SMA40 > SMA40[1]
-        - DI+ > ADX > DI-
         """
         try:
-            # Get sufficient data for ADX calculation
+            # Get sufficient data for SMA calculation
             df = pyupbit.get_ohlcv(ticker, interval=CANDLE_INTERVAL, count=200)
 
             if df is None or len(df) < 50:
@@ -240,22 +241,20 @@ class UpbitAutoTrader:
             df['sma20'] = self.calculate_sma(df, 20)
             df['sma40'] = self.calculate_sma(df, 40)
 
-            # Calculate ADX, DI+, DI-
-            df['adx'], df['plus_di'], df['minus_di'] = self.calculate_adx(df)
-
-            # Get latest data
+            # Get latest and previous data
             latest = df.iloc[-1]
-            prev_sma40 = df.iloc[-2]['sma40']
+            prev = df.iloc[-2]
 
-            # Check conditions
-            condition1 = latest['sma5'] > latest['sma10'] > latest['sma20']
-            condition2 = latest['sma40'] > prev_sma40
-            condition3 = latest['plus_di'] > latest['adx'] > latest['minus_di']
+            # Check conditions: all SMAs are rising
+            condition1 = latest['sma5'] > prev['sma5']
+            condition2 = latest['sma10'] > prev['sma10']
+            condition3 = latest['sma20'] > prev['sma20']
+            condition4 = latest['sma40'] > prev['sma40']
 
-            if pd.isna(condition1) or pd.isna(condition2) or pd.isna(condition3):
+            if pd.isna(condition1) or pd.isna(condition2) or pd.isna(condition3) or pd.isna(condition4):
                 return False
 
-            result = condition1 and condition2 and condition3
+            result = condition1 and condition2 and condition3 and condition4
             return result
 
         except Exception as e:
