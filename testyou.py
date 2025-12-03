@@ -222,39 +222,48 @@ class UpbitAutoTrader:
 
     def check_buy_condition(self, ticker):
         """
-        Check buy conditions:
-        - SMA5 > SMA5[1]
-        - SMA10 > SMA10[1]
-        - SMA20 > SMA20[1]
-        - SMA40 > SMA40[1]
+        Check buy conditions (DMI/ADX strategy):
+        1. DI+ > ADX > DI-
+        2. DI+ rising (DI+ > DI+[1])
+        3. DI- falling (DI- < DI-[1])
+        4. DI+ angle >= 70 degrees
         """
         try:
-            # Get sufficient data for SMA calculation
+            # Get sufficient data for ADX calculation
             df = pyupbit.get_ohlcv(ticker, interval=CANDLE_INTERVAL, count=200)
 
             if df is None or len(df) < 50:
                 return False
 
-            # Calculate SMAs
-            df['sma5'] = self.calculate_sma(df, 5)
-            df['sma10'] = self.calculate_sma(df, 10)
-            df['sma20'] = self.calculate_sma(df, 20)
-            df['sma40'] = self.calculate_sma(df, 40)
+            # Calculate ADX, DI+, DI-
+            df['adx'], df['di_plus'], df['di_minus'] = self.calculate_adx(df, period=14)
 
             # Get latest and previous data
             latest = df.iloc[-1]
             prev = df.iloc[-2]
 
-            # Check conditions: all SMAs are rising
-            condition1 = latest['sma5'] > prev['sma5']
-            condition2 = latest['sma10'] > prev['sma10']
-            condition3 = latest['sma20'] > prev['sma20']
-            condition4 = latest['sma40'] > prev['sma40']
-
-            if pd.isna(condition1) or pd.isna(condition2) or pd.isna(condition3) or pd.isna(condition4):
+            # Check if values are valid
+            if pd.isna(latest['adx']) or pd.isna(latest['di_plus']) or pd.isna(latest['di_minus']):
+                return False
+            if pd.isna(prev['di_plus']) or pd.isna(prev['di_minus']):
                 return False
 
-            result = condition1 and condition2 and condition3 and condition4
+            # Condition 1: DI+ > ADX > DI-
+            dmi_order_ok = (latest['di_plus'] > latest['adx']) and (latest['adx'] > latest['di_minus'])
+
+            # Condition 2: DI+ rising
+            di_plus_up = latest['di_plus'] > prev['di_plus']
+
+            # Condition 3: DI- falling
+            di_minus_down = latest['di_minus'] < prev['di_minus']
+
+            # Condition 4: DI+ angle >= 70 degrees
+            slope = latest['di_plus'] - prev['di_plus']
+            angle_deg = np.arctan(slope) * 180 / np.pi
+            angle_condition = angle_deg >= 70
+
+            # All conditions must be true
+            result = dmi_order_ok and di_plus_up and di_minus_down and angle_condition
             return result
 
         except Exception as e:
@@ -263,9 +272,8 @@ class UpbitAutoTrader:
 
     def check_sell_condition(self, ticker):
         """
-        Check sell conditions:
-        - ADX < ADX[1] and ADX[1] < ADX[2] and ADX[2] < ADX[3]
-        (ADX declining for 3 consecutive candles)
+        Check sell conditions (DMI/ADX strategy):
+        - DI+ <= DI-
         """
         try:
             df = pyupbit.get_ohlcv(ticker, interval=CANDLE_INTERVAL, count=200)
@@ -273,19 +281,17 @@ class UpbitAutoTrader:
             if df is None or len(df) < 50:
                 return False
 
-            # Calculate ADX
-            df['adx'], _, _ = self.calculate_adx(df)
+            # Calculate ADX, DI+, DI-
+            df['adx'], df['di_plus'], df['di_minus'] = self.calculate_adx(df, period=14)
 
-            # Get last 4 ADX values
-            adx_0 = df.iloc[-1]['adx']  # Current
-            adx_1 = df.iloc[-2]['adx']  # 1 candle ago
-            adx_2 = df.iloc[-3]['adx']  # 2 candles ago
-            adx_3 = df.iloc[-4]['adx']  # 3 candles ago
+            # Get latest data
+            latest = df.iloc[-1]
 
-            if pd.isna(adx_0) or pd.isna(adx_1) or pd.isna(adx_2) or pd.isna(adx_3):
+            if pd.isna(latest['di_plus']) or pd.isna(latest['di_minus']):
                 return False
 
-            result = (adx_0 < adx_1) and (adx_1 < adx_2) and (adx_2 < adx_3)
+            # Sell condition: DI+ <= DI-
+            result = latest['di_plus'] <= latest['di_minus']
             return result
 
         except Exception as e:
