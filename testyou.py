@@ -192,7 +192,7 @@ class UpbitAutoTrader:
             result = condition1 and condition2 and condition3
 
             if result:
-                logger.info(f"✅ 매수 시그널: {ticker}")
+                logger.info(f"[매수신호] {ticker}")
 
             return result
 
@@ -227,7 +227,7 @@ class UpbitAutoTrader:
             result = (adx_0 < adx_1) and (adx_1 < adx_2) and (adx_2 < adx_3)
 
             if result:
-                logger.info(f"🔴 매도 시그널: {ticker}")
+                logger.info(f"[매도신호] {ticker}")
 
             return result
 
@@ -317,7 +317,7 @@ class UpbitAutoTrader:
                 total_trades = self.win_count + self.lose_count
                 win_rate = (self.win_count / total_trades * 100) if total_trades > 0 else 0
 
-                logger.info(f"💰 매수체결: {ticker} | {current_price:,.0f}원 × {coin_amount:.4f}개 = {buy_amount:,.0f}원 | 승률: {win_rate:.1f}%")
+                logger.info(f"[매수체결] {ticker} | {current_price:,.0f}원 x {coin_amount:.4f}개 = {buy_amount:,.0f}원 | 승률: {win_rate:.1f}%")
                 return True
             else:
                 # Real buy
@@ -391,8 +391,7 @@ class UpbitAutoTrader:
                 total_trades = self.win_count + self.lose_count
                 win_rate = (self.win_count / total_trades * 100) if total_trades > 0 else 0
 
-                result_emoji = "🟢" if profit > 0 else "🔴"
-                logger.info(f"{result_emoji} 매도체결({result_text}): {ticker} | {avg_buy_price:,.0f}→{current_price:,.0f}원 | "
+                logger.info(f"[매도체결-{result_text}] {ticker} | {avg_buy_price:,.0f}->{current_price:,.0f}원 | "
                           f"손익: {profit:+,.0f}원({profit_rate:+.2f}%) | 승률: {win_rate:.1f}%({self.win_count}승{self.lose_count}패)")
                 return True
             else:
@@ -420,7 +419,7 @@ class UpbitAutoTrader:
             if ticker not in new_targets:
                 balance = self.get_balance(ticker)
                 if balance > 0:
-                    logger.info(f"⚠️ {ticker} 대상제외 - 전량매도")
+                    logger.info(f"[대상제외] {ticker} - 전량매도")
                     self.sell_coin(ticker)
                     removed_count += 1
 
@@ -468,7 +467,7 @@ class UpbitAutoTrader:
                     total_profit += profit
                     holding_count += 1
 
-                    logger.info(f"  📊 {ticker}: {avg_buy_price:,.0f}→{current_price:,.0f}원 | "
+                    logger.info(f"  [보유] {ticker}: {avg_buy_price:,.0f}->{current_price:,.0f}원 | "
                               f"평가: {value:,.0f}원 | 손익: {profit:+,.0f}원({profit_rate:+.2f}%)")
 
         # Show P&L for dry run mode
@@ -478,7 +477,7 @@ class UpbitAutoTrader:
             total_trades = self.win_count + self.lose_count
             win_rate = (self.win_count / total_trades * 100) if total_trades > 0 else 0
 
-            logger.info(f"💼 총평가: {total_value:,.0f}원 | 총손익: {pnl:+,.0f}원({pnl_percent:+.2f}%) | "
+            logger.info(f"[요약] 총평가: {total_value:,.0f}원 | 총손익: {pnl:+,.0f}원({pnl_percent:+.2f}%) | "
                       f"보유: {holding_count}개 | 승률: {win_rate:.1f}%({self.win_count}승{self.lose_count}패)")
 
         logger.info("")  # Empty line for readability
@@ -563,7 +562,7 @@ class UpbitAutoTrader:
             try:
                 iteration += 1
                 logger.info(f"\n{'='*70}")
-                logger.info(f"🔄 #{iteration} | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                logger.info(f"[반복 #{iteration}] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
                 logger.info(f"{'='*70}")
 
                 # Update target coins list
@@ -573,7 +572,7 @@ class UpbitAutoTrader:
                 self.monitor_and_trade()
 
                 # Wait
-                logger.info(f"⏳ {MONITOR_INTERVAL}초 대기...\n")
+                logger.info(f"[대기] {MONITOR_INTERVAL}초...\n")
                 time.sleep(MONITOR_INTERVAL)
 
             except KeyboardInterrupt:
