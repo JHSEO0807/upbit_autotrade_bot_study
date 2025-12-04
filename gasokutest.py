@@ -21,8 +21,8 @@ class AccelerationDataCollector:
         
         # 데이터 저장
         self.data_history = []  # 모든 기록
-        self.prices_10s_ago = {}
-        self.velocities_10s_ago = {}
+        self.prices_prev = {}  # 이전 시점 가격
+        self.velocities_prev = {}  # 이전 시점 속도
         
         # 모니터링 대상 코인
         self.target_markets = []
@@ -86,47 +86,47 @@ class AccelerationDataCollector:
     def calculate_metrics(self, tickers, timestamp):
         """속도와 가속도 계산"""
         records = []
-        
+
         for ticker in tickers:
             market = ticker['market']
             current_price = ticker['trade_price']
             change_rate_24h = ticker['signed_change_rate'] * 100
-            
-            # 속도 계산 (10초 전 가격 필요)
+
+            # 속도 계산 (이전 시점 가격 필요)
             velocity = None
             acceleration = None
-            
-            if market in self.prices_10s_ago:
-                price_10s_ago = self.prices_10s_ago[market]
-                
-                # 속도 = (현재가 - 10초전가) / 10초전가 × 100
-                velocity = ((current_price - price_10s_ago) / price_10s_ago) * 100
-                
-                # 가속도 계산 (10초 전 속도 필요)
-                if market in self.velocities_10s_ago:
-                    velocity_10s_ago = self.velocities_10s_ago[market]
-                    
-                    # 가속도 = 현재속도 - 10초전속도
-                    acceleration = velocity - velocity_10s_ago
-            
+
+            if market in self.prices_prev:
+                price_prev = self.prices_prev[market]
+
+                # 속도 = (현재가 - 이전가) / 이전가 × 100
+                velocity = ((current_price - price_prev) / price_prev) * 100
+
+                # 가속도 계산 (이전 시점 속도 필요)
+                if market in self.velocities_prev:
+                    velocity_prev = self.velocities_prev[market]
+
+                    # 가속도 = 현재속도 - 이전속도
+                    acceleration = velocity - velocity_prev
+
             # 기록 저장
             record = {
                 '시간': timestamp,
                 '종목': market,
                 '현재가': current_price,
                 '전일대비(%)': change_rate_24h,
-                '속도_10초(%)': velocity if velocity is not None else 0,
+                f'속도_{self.check_interval}초(%)': velocity if velocity is not None else 0,
                 '가속도(%p)': acceleration if acceleration is not None else 0,
-                '10초전가격': self.prices_10s_ago.get(market, current_price)
+                '이전가격': self.prices_prev.get(market, current_price)
             }
-            
+
             records.append(record)
-            
+
             # 다음 계산을 위해 저장
-            self.prices_10s_ago[market] = current_price
+            self.prices_prev[market] = current_price
             if velocity is not None:
-                self.velocities_10s_ago[market] = velocity
-        
+                self.velocities_prev[market] = velocity
+
         return records
     
     def print_current_status(self, records):
@@ -134,22 +134,26 @@ class AccelerationDataCollector:
         print(f"\n{'='*100}")
         print(f"[{records[0]['시간']}] 📊 실시간 모니터링")
         print(f"{'='*100}")
-        print(f"{'종목':<12} {'현재가':<15} {'전일대비':<12} {'속도(10초)':<15} {'가속도':<15}")
+
+        # 동적으로 속도 컬럼명 가져오기
+        velocity_col = [k for k in records[0].keys() if k.startswith('속도_')][0]
+
+        print(f"{'종목':<12} {'현재가':<15} {'전일대비':<12} {'속도':<15} {'가속도':<15}")
         print("-" * 100)
-        
+
         # 가속도 높은 순으로 정렬
         sorted_records = sorted(records, key=lambda x: x['가속도(%p)'], reverse=True)
-        
+
         for record in sorted_records[:10]:  # 상위 10개만 출력
-            velocity_str = f"{record['속도_10초(%)']:+.4f}%" if record['속도_10초(%)'] != 0 else "계산중"
+            velocity_str = f"{record[velocity_col]:+.4f}%" if record[velocity_col] != 0 else "계산중"
             accel_str = f"{record['가속도(%p)']:+.4f}%p" if record['가속도(%p)'] != 0 else "계산중"
-            
+
             print(f"{record['종목']:<12} "
                   f"{record['현재가']:>12,.2f}원 "
                   f"{record['전일대비(%)']:>+9.2f}% "
                   f"{velocity_str:>13} "
                   f"{accel_str:>13}")
-        
+
         print(f"{'='*100}\n")
     
     def save_to_excel(self):
@@ -178,21 +182,25 @@ class AccelerationDataCollector:
             
             # 요약 통계 시트
             summary_data = []
+            # 동적으로 속도 컬럼명 찾기
+            velocity_cols = [col for col in df.columns if col.startswith('속도_')]
+            velocity_col = velocity_cols[0] if velocity_cols else None
+
             for market in self.target_markets:
                 market_df = df[df['종목'] == market]
-                
-                if len(market_df) > 0:
+
+                if len(market_df) > 0 and velocity_col:
                     summary = {
                         '종목': market,
-                        '평균속도': market_df['속도_10초(%)'].mean(),
-                        '최대속도': market_df['속도_10초(%)'].max(),
-                        '최소속도': market_df['속도_10초(%)'].min(),
+                        '평균속도': market_df[velocity_col].mean(),
+                        '최대속도': market_df[velocity_col].max(),
+                        '최소속도': market_df[velocity_col].min(),
                         '평균가속도': market_df['가속도(%p)'].mean(),
                         '최대가속도': market_df['가속도(%p)'].max(),
                         '최소가속도': market_df['가속도(%p)'].min(),
                         '최종가격': market_df.iloc[-1]['현재가'],
                         '시작가격': market_df.iloc[0]['현재가'],
-                        '총변화율(%)': ((market_df.iloc[-1]['현재가'] - market_df.iloc[0]['현재가']) 
+                        '총변화율(%)': ((market_df.iloc[-1]['현재가'] - market_df.iloc[0]['현재가'])
                                      / market_df.iloc[0]['현재가'] * 100)
                     }
                     summary_data.append(summary)
@@ -356,7 +364,7 @@ class AccelerationDataCollector:
 if __name__ == "__main__":
     collector = AccelerationDataCollector(
         top_n=20,              # 상위 20개 종목
-        check_interval=10,     # 10초마다 수집
+        check_interval=30,     # 30초마다 수집
         duration_minutes=30    # 30분 동안 수집
     )
     
