@@ -23,7 +23,12 @@ class AccelerationDataCollector:
         self.data_history = []  # 모든 기록
         self.prices_prev = {}  # 이전 시점 가격
         self.velocities_prev = {}  # 이전 시점 속도
-        
+
+        # 최대/최소 가속도 추적
+        self.max_accel_record = None  # 최대 가속도 기록
+        self.min_accel_record = None  # 최소 가속도 기록
+        self.max_accel_tracking = []  # 최대 가속도 이후 가격 변화 추적
+
         # 모니터링 대상 코인
         self.target_markets = []
     
@@ -122,6 +127,18 @@ class AccelerationDataCollector:
 
             records.append(record)
 
+            # 최대/최소 가속도 업데이트
+            if acceleration is not None:
+                if self.max_accel_record is None or acceleration > self.max_accel_record['가속도(%p)']:
+                    self.max_accel_record = record.copy()
+                    print(f"\n🔥 새로운 최대 가속도 발견!")
+                    print(f"   종목: {market} | 가속도: {acceleration:+.4f}%p | 가격: {current_price:,.0f}원")
+
+                if self.min_accel_record is None or acceleration < self.min_accel_record['가속도(%p)']:
+                    self.min_accel_record = record.copy()
+                    print(f"\n❄️  새로운 최소 가속도 발견!")
+                    print(f"   종목: {market} | 가속도: {acceleration:+.4f}%p | 가격: {current_price:,.0f}원")
+
             # 다음 계산을 위해 저장
             self.prices_prev[market] = current_price
             if velocity is not None:
@@ -207,7 +224,41 @@ class AccelerationDataCollector:
             
             summary_df = pd.DataFrame(summary_data)
             summary_df.to_excel(writer, sheet_name='요약통계', index=False)
-        
+
+            # 최대/최소 가속도 분석 시트
+            if self.max_accel_record and self.min_accel_record:
+                accel_analysis = []
+
+                # 최대 가속도 정보
+                max_info = {
+                    '구분': '최대 가속도',
+                    '종목': self.max_accel_record['종목'],
+                    '발생시간': self.max_accel_record['시간'],
+                    '가속도(%p)': self.max_accel_record['가속도(%p)'],
+                    '발생시가격': self.max_accel_record['현재가'],
+                    '전일대비(%)': self.max_accel_record['전일대비(%)']
+                }
+                accel_analysis.append(max_info)
+
+                # 최소 가속도 정보
+                min_info = {
+                    '구분': '최소 가속도',
+                    '종목': self.min_accel_record['종목'],
+                    '발생시간': self.min_accel_record['시간'],
+                    '가속도(%p)': self.min_accel_record['가속도(%p)'],
+                    '발생시가격': self.min_accel_record['현재가'],
+                    '전일대비(%)': self.min_accel_record['전일대비(%)']
+                }
+                accel_analysis.append(min_info)
+
+                accel_df = pd.DataFrame(accel_analysis)
+                accel_df.to_excel(writer, sheet_name='최대최소가속도', index=False)
+
+            # 최대 가속도 종목 추적 시트
+            if self.max_accel_tracking:
+                tracking_df = pd.DataFrame(self.max_accel_tracking)
+                tracking_df.to_excel(writer, sheet_name='최대가속도종목추적', index=False)
+
         # 엑셀 스타일 적용
         self.apply_excel_formatting(filename)
         
@@ -215,6 +266,19 @@ class AccelerationDataCollector:
         print(f"✅ 데이터 저장 완료!")
         print(f"파일명: {filename}")
         print(f"총 데이터: {len(self.data_history)}개 기록")
+
+        # 최대 가속도 종목의 최종 결과 출력
+        if self.max_accel_tracking:
+            last_tracking = self.max_accel_tracking[-1]
+            print(f"\n📊 최대 가속도 종목 분석:")
+            print(f"   종목: {last_tracking['종목']}")
+            print(f"   최대가속도: {last_tracking['최대가속도']:+.4f}%p")
+            print(f"   발생시간: {last_tracking['최대가속도발생시간']}")
+            print(f"   발생시가격: {last_tracking['발생시가격']:,.0f}원")
+            print(f"   최종가격: {last_tracking['현재가격']:,.0f}원")
+            print(f"   가격변화: {last_tracking['가격변화(%)']:+.2f}%")
+            print(f"   경과시간: {last_tracking['경과시간(분)']:.1f}분")
+
         print(f"{'='*80}\n")
     
     def apply_excel_formatting(self, filename):
@@ -319,10 +383,35 @@ class AccelerationDataCollector:
                 if tickers:
                     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                     records = self.calculate_metrics(tickers, timestamp)
-                    
+
                     # 전체 히스토리에 추가
                     self.data_history.extend(records)
-                    
+
+                    # 최대 가속도 종목의 가격 변화 추적
+                    if self.max_accel_record:
+                        max_accel_market = self.max_accel_record['종목']
+                        max_accel_price = self.max_accel_record['현재가']
+                        max_accel_time = self.max_accel_record['시간']
+
+                        # 현재 가격 찾기
+                        current_record = next((r for r in records if r['종목'] == max_accel_market), None)
+                        if current_record:
+                            current_price = current_record['현재가']
+                            price_change_pct = ((current_price - max_accel_price) / max_accel_price) * 100
+
+                            tracking_record = {
+                                '측정시간': timestamp,
+                                '최대가속도발생시간': max_accel_time,
+                                '종목': max_accel_market,
+                                '최대가속도': self.max_accel_record['가속도(%p)'],
+                                '발생시가격': max_accel_price,
+                                '현재가격': current_price,
+                                '가격변화(%)': price_change_pct,
+                                '경과시간(분)': (datetime.strptime(timestamp, '%Y-%m-%d %H:%M:%S') -
+                                               datetime.strptime(max_accel_time, '%Y-%m-%d %H:%M:%S')).total_seconds() / 60
+                            }
+                            self.max_accel_tracking.append(tracking_record)
+
                     # 상태 출력
                     self.print_current_status(records)
 
@@ -374,7 +463,7 @@ if __name__ == "__main__":
     collector = AccelerationDataCollector(
         top_n=20,              # 상위 20개 종목
         check_interval=30,     # 30초마다 수집
-        duration_minutes=None  # 무제한 (Ctrl+C로 종료)
+        duration_minutes=360   # 6시간 (360분) 동안 수집
     )
     
     collector.run()
